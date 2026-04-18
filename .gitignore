@@ -1,0 +1,124 @@
+# ── Python ──────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+wheels/
+.installed.cfg
+MANIFEST
+pip-wheel-metadata/
+
+# ── Virtualenvs ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+ENV/
+.python-version
+
+# ── Test / coverage artefacts ───────────────────────────────────────
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+coverage.xml
+*.cover
+.hypothesis/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.pytype/
+
+# ── IDE / editor ────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+*.sublime-project
+*.sublime-workspace
+
+# ── OS junk ────────────────────────────────────────────────────────
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# ── Secrets / local config ─────────────────────────────────────────
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+secrets.yaml
+secrets.json
+
+# ── AEGIS runtime state (operator-local, never commit) ─────────────
+# Logs (rotating)
+logs/
+*.log
+*.log.*
+
+# Event store + WAL/SHM
+data/events.db
+data/events.db-wal
+data/events.db-shm
+data/events.db.bak-*/
+
+# Anomaly model + training checkpoint (per-host baseline)
+data/anomaly_model.pkl
+data/anomaly_model.training.pkl
+
+# Persistence-mechanism baseline
+data/persistence.baseline.json
+
+# Threat-intel cache
+data/threat_intel_cache.json
+
+# Forensic snapshots
+data/forensics/
+
+# Quarantined files (operator-only, may contain malware)
+quarantine/
+
+# Self-protect manifest (regenerated via --build-manifest)
+data/manifest.json
+data/integrity.manifest.json
+
+# FIM baseline (per-host)
+data/baseline.db
+data/baseline.db-wal
+data/baseline.db-shm
+
+# Stray data files
+data/*.tmp
+data/*.bak
+
+# ── NSSM / Windows service artefacts ────────────────────────────────
+service.out.log
+service.err.log
+*.pid
+
+# ── Jupyter / notebooks ────────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── Misc ───────────────────────────────────────────────────────────
+*.bak
+*.orig
+*.rej
+node_modules/
+
+# Claude Code workspace state
+.claude/
+
+# Brace-expansion artefact from a non-bash shell (literal dir name)
+{aegis/
