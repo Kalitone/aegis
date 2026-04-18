@@ -1,0 +1,234 @@
+# ═══════════════════════════════════════════════════════════
+# AEGIS Configuration
+# Adaptive Endpoint Guardian Intelligence System
+# ═══════════════════════════════════════════════════════════
+
+core:
+  log_level: INFO
+  log_file: logs/aegis.log
+  log_json_file: logs/aegis.json.log
+  log_max_bytes: 10485760   # 10 MB per log file before rotation
+  log_backup_count: 14      # keep ~2 weeks of daily-ish rotations
+  data_dir: data
+  quarantine_dir: quarantine
+  event_db: data/events.db
+
+monitors:
+  fim:
+    enabled: true
+    watch_paths:
+      # Critical system paths — modify for your OS
+      # Windows paths (primary target)
+      - C:\Windows\System32
+      - C:\Windows\SysWOW64
+      - C:\Users
+      # Linux paths (when running on Linux)
+      - /etc
+      - /usr/bin
+      - /usr/sbin
+      - /usr/lib
+      - /home
+      - /tmp
+      - /var/tmp
+    exclude_patterns:
+      - "*.log"
+      - "*.tmp"
+      - "*.swp"
+      - "__pycache__"
+      - ".git"
+    baseline_on_start: true
+    hash_algorithm: sha256
+
+  process:
+    enabled: true
+    poll_interval_ms: 500
+    track_children: true
+    capture_environ: true
+    capture_cmdline: true
+    suspicious_parents:
+      # Processes that should rarely spawn children
+      - svchost.exe
+      - services.exe
+      - lsass.exe
+      - smss.exe
+      - csrss.exe
+      - wininit.exe
+      # Linux equivalents
+      - cron
+      - atd
+
+  network:
+    enabled: true
+    poll_interval_ms: 1000
+    alert_on_new_listen: true
+    alert_on_new_outbound: true
+    trusted_ports:
+      - 80
+      - 443
+      - 53
+    suspicious_ports:
+      - 4444    # Metasploit default
+      - 5555    # Common RAT
+      - 1337    # Common backdoor
+      - 31337   # Back Orifice
+      - 6666    # IRC (C2)
+      - 6667    # IRC (C2)
+      - 8888    # Common alt HTTP
+      - 9001    # Tor
+      - 9050    # Tor SOCKS
+
+  resource:
+    enabled: true
+    poll_interval_ms: 5000
+    cpu_threshold_percent: 85
+    cpu_sustained_seconds: 30
+    memory_growth_mb_per_min: 500
+    disk_write_mb_per_sec: 100
+
+  # ─── Persistence-mechanism scanner ──────────────────────────
+  # Snapshots Run keys, Scheduled Tasks, Services, WMI subs,
+  # Startup folders, IFEO, AppInit_DLLs (Windows) and cron /
+  # systemd / ld.so.preload (Linux). First poll establishes the
+  # baseline; subsequent diffs publish PROC_SUSPICIOUS events.
+  persistence:
+    enabled: true
+    poll_interval_ms: 300000   # 5 minutes
+    baseline_path: data/persistence.baseline.json
+
+  # ─── DNS + TLS SNI capture ──────────────────────────────────
+  # On Windows this polls `ipconfig /displaydns` for new domains;
+  # SNI capture is off by default (requires scapy + npcap).
+  dns:
+    enabled: true
+    poll_interval_seconds: 30
+    sni_capture: false         # set true if scapy + npcap installed
+
+detection:
+  yara:
+    enabled: true
+    rules_dir: rules/yara
+    scan_on_create: true
+    scan_on_modify: true
+    scan_timeout_seconds: 30
+    max_file_size_mb: 100
+    # Path substrings and file extensions to skip on top of the built-in
+    # excludes (browser caches, Windows event logs, SQLite DBs, VS Code
+    # workspace state, AEGIS's own data dir, etc.). String-based YARA rules
+    # FP heavily against those — scan binaries and scripts, not text caches.
+    exclude_paths: []          # e.g. ["/MyApp/cache/"]
+    exclude_extensions: []     # e.g. [".cache", ".pack"]
+
+  behavioral:
+    enabled: true
+    rules_dir: rules/behavioral
+    correlation_window_seconds: 10
+
+  anomaly:
+    enabled: true
+    model_path: data/anomaly_model.pkl
+    training_period_hours: 24
+    min_training_samples: 200
+    contamination: 0.01
+    auto_train: true
+    features:
+      - cpu_percent
+      - memory_mb
+      - open_fds
+      - child_count
+      - net_connections
+      - file_writes_per_sec
+      - cmdline_entropy
+
+  supply_chain:
+    enabled: true
+    typosquat_max_distance: 2
+    malicious_db_path: rules/supply_chain/known_malicious.json
+
+  # ─── Sigma rule loader ───────────────────────────────────────
+  # Translates a subset of SigmaHQ process_creation rules into
+  # AEGIS behavioral rules at startup. Drop any .yml/.yaml from
+  # https://github.com/SigmaHQ/sigma into rules_dir.
+  sigma:
+    enabled: false
+    rules_dir: rules/sigma
+    max_rules: 0               # 0 = no cap
+
+  # ─── Threat-intel feeds ──────────────────────────────────────
+  # Pulls public IOC feeds (URLhaus, Feodo, ThreatFox,
+  # DigitalSide) hourly and flags matching domains/IPs/hashes.
+  # Cache survives restarts.
+  threat_intel:
+    enabled: true
+    refresh_seconds: 3600
+    cache_path: data/threat_intel_cache.json
+
+response:
+  auto_respond: true
+  severity_actions:
+    critical:
+      - kill_process
+      - quarantine_file
+      - forensic_snapshot
+      - alert
+    high:
+      - quarantine_file
+      - alert
+      - forensic_snapshot
+    medium:
+      - alert
+      - log
+    low:
+      - log
+
+dashboard:
+  enabled: true
+  refresh_interval_ms: 1000
+  max_events_displayed: 50
+  max_alerts_displayed: 20
+
+# ─── Web dashboard ────────────────────────────────────────────
+# Loopback FastAPI/HTMX UI for live triage. http://127.0.0.1:8765
+dashboard_web:
+  enabled: true
+  host: 127.0.0.1
+  port: 8765
+
+# ─── Self-protection / tamper resistance ─────────────────────
+# manifest_check: hash config + rules at startup, fail (or warn) on drift.
+# strict:         true → SystemExit on any mismatch; false → warn-only.
+# parent_check:   refuse to start if parent isn't services.exe / NSSM / shell.
+# watchdog:       spawn a detached supervisor process that respawns AEGIS
+#                 if our PID dies unexpectedly (turn off for dev work).
+self_protect:
+  manifest_check: true
+  strict: false
+  parent_check: false
+  watchdog: false
+
+# ─── Daily rule auto-update ───────────────────────────────────
+rule_updates:
+  enabled: false           # turn on once you've vetted the upstream sources
+  interval_hours: 24
+
+# ─── Outbound alerting ────────────────────────────────────────
+# Webhook: Slack, Discord, Teams, or any JSON-receiving endpoint.
+# Email:   SMTP — leave smtp_host blank to disable.
+alerting:
+  webhook:
+    url: ""                   # e.g. https://hooks.slack.com/services/...
+    style: generic            # generic | slack | discord | teams
+    min_severity: high        # info | low | medium | high | critical
+    timeout_seconds: 5
+  toast:
+    enabled: true              # Native Windows 10/11 toast popups (requires `pip install winotify`)
+    min_severity: high         # info | low | medium | high | critical
+    app_id: AEGIS
+    icon_path: ""              # absolute path to a .ico file (optional)
+  email:
+    smtp_host: ""             # e.g. smtp.gmail.com
+    smtp_port: 587
+    smtp_username: ""
+    smtp_password: ""         # or set AEGIS_SMTP_PASSWORD env var
+    from_address: aegis@localhost
+    to_addresses: []          # list of recipients
+    min_severity: critical

@@ -1,0 +1,53 @@
+{
+  "description": "AEGIS — Seed list of publicly reported malicious package names.",
+  "sources": [
+    "Public PyPI/npm advisories",
+    "Snyk, Sonatype, Phylum public disclosures"
+  ],
+  "pypi": [
+    "jeilyfish",
+    "python3-dateutil",
+    "urllib",
+    "libpeshnx",
+    "libpesh",
+    "colourama",
+    "djanga",
+    "reqeusts",
+    "beautifulsoup",
+    "opencv",
+    "mumpy",
+    "matplotlibcolor",
+    "pytorch",
+    "tensorflow-gpu",
+    "setup-tools"
+  ],
+  "npm": [
+    "crossenv",
+    "cross-env.js",
+    "d3.js",
+    "fabric-js",
+    "ffmepg",
+    "gruntcli",
+    "http-proxy.js",
+    "jquery.js",
+    "mariadb",
+    "mongose",
+    "mssql.js",
+    "mssql-node",
+    "node-fabric",
+    "node-opencv",
+    "node-opensl",
+    "node-openssl",
+    "nodecaffe",
+    "nodefabric",
+    "nodeffmpeg",
+    "nodemailer-js",
+    "nodemailer.js",
+    "nodemssql",
+    "node-tkinter",
+    "shadowsock",
+    "smb",
+    "sqlserver",
+    "tkinter"
+  ]
+}
