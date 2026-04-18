@@ -98,6 +98,10 @@ data/integrity.manifest.json
 data/baseline.db
 data/baseline.db-wal
 data/baseline.db-shm
+data/baseline.db-journal
+
+# Self-protect clean-shutdown marker
+data/.aegis_clean_shutdown
 
 # Stray data files
 data/*.tmp
