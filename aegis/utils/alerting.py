@@ -31,6 +31,7 @@ from email.mime.text import MIMEText
 from pathlib import Path
 
 from aegis.core import EventBus, Event, EventCategory, Severity
+from aegis.utils.ocsf import event_to_ocsf
 
 logger = logging.getLogger("aegis.utils.alerting")
 
@@ -303,6 +304,103 @@ class ToastAlerter(_AsyncTransport):
         if event.severity.value == "critical":
             toast.set_audio(self._winotify.audio.LoopingAlarm, loop=False)
         toast.show()
+
+
+class OcsfFileSink:
+    """Writes every AEGIS event in OCSF v1.1.0 JSON-lines to a
+    rotating file, suitable for SIEM ingestion (Splunk Forwarder /
+    Filebeat / Vector / fluentd tailing the file).
+
+    Subscribes to the wildcard `*` so the file is the full audit
+    stream — not just alerts — which is what makes the hash-chained
+    log a credible export artifact. Per-event mapping is delegated to
+    `aegis.utils.ocsf.event_to_ocsf`; this class is just transport.
+
+    Synchronous on the publisher thread on purpose: rotating-file
+    writes are fast (≪1 ms) and putting OCSF behind a queue would
+    create a window where a crash could lose post-publish events
+    that are already in the hash chain. If the path is on a slow
+    disk and you need async behaviour, point it at a tmpfs / a
+    ramdisk that an external forwarder drains.
+    """
+
+    def __init__(self, event_bus: EventBus, config: dict):
+        self.bus = event_bus
+        self.enabled = bool(config.get("enabled", False))
+        self.path = Path(config.get("path", "logs/ocsf.json"))
+        self.max_bytes = int(config.get("max_bytes", 10 * 1024 * 1024))
+        self.backups = int(config.get("backup_count", 7))
+        self.product_name = config.get("product_name", "AEGIS")
+        self.product_vendor = config.get("product_vendor", "AEGIS")
+        self.product_version = config.get("product_version", "0.2.0")
+        self.schema_version = config.get("schema_version", "1.1.0")
+        self._handler: logging.handlers.RotatingFileHandler | None = None
+        self._logger: logging.Logger | None = None
+        self._running = False
+
+    def start(self):
+        if not self.enabled:
+            logger.info("OcsfFileSink: disabled in config")
+            return
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            logger.warning(f"OcsfFileSink: cannot create {self.path.parent}: {e}")
+            return
+
+        # Dedicated logger so we don't pollute root with passthrough
+        # JSON-lines. propagate=False prevents the OCSF stream from
+        # appearing in the regular text log.
+        self._logger = logging.getLogger("aegis.ocsf.sink")
+        self._logger.setLevel(logging.INFO)
+        self._logger.propagate = False
+        for h in list(self._logger.handlers):
+            self._logger.removeHandler(h)
+
+        self._handler = logging.handlers.RotatingFileHandler(
+            self.path, maxBytes=self.max_bytes, backupCount=self.backups,
+            encoding="utf-8",
+        )
+        # Passthrough formatter — the message we log IS the JSON line.
+        self._handler.setFormatter(logging.Formatter("%(message)s"))
+        self._logger.addHandler(self._handler)
+
+        self.bus.subscribe("*", self._on_event)
+        self._running = True
+        logger.info(f"OcsfFileSink started → {self.path}")
+
+    def stop(self):
+        self._running = False
+        if self._handler is not None:
+            try:
+                self._handler.close()
+            except Exception:
+                pass
+        if self._logger is not None and self._handler is not None:
+            try:
+                self._logger.removeHandler(self._handler)
+            except Exception:
+                pass
+        self._handler = None
+        self._logger = None
+
+    def _on_event(self, event: Event):
+        if not self._running or self._logger is None:
+            return
+        try:
+            obj = event_to_ocsf(
+                event,
+                product_name=self.product_name,
+                product_vendor=self.product_vendor,
+                product_version=self.product_version,
+                schema_version=self.schema_version,
+            )
+            self._logger.info(json.dumps(obj, default=str))
+        except Exception as e:
+            # OCSF errors are NEVER allowed to break the hot path —
+            # the bus has already accepted the event and persisted to
+            # the chain; an export glitch can't undo that.
+            logger.error(f"OcsfFileSink: emit failed: {e}", exc_info=False)
 
 
 class EmailAlerter(_AsyncTransport):

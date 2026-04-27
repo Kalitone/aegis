@@ -64,11 +64,29 @@ def _enumerate_protected_files(root: Path, config_path: Path | None) -> list[Pat
     return sorted(candidates)
 
 
+def _canonical_payload(manifest: dict) -> bytes:
+    """Bytes that the attestation signature covers. Excludes the
+    `attestation` block itself (chicken-and-egg) and uses sorted-keys
+    JSON so build / verify agree byte-for-byte."""
+    body = {k: v for k, v in manifest.items() if k != "attestation"}
+    return json.dumps(body, sort_keys=True, separators=(",", ":"),
+                      default=str).encode("utf-8")
+
+
 def build_manifest(project_root: str | os.PathLike,
                    config_path: str | os.PathLike | None,
-                   manifest_path: str | os.PathLike | None = None) -> dict:
+                   manifest_path: str | os.PathLike | None = None,
+                   *,
+                   attest: bool = True) -> dict:
     """Hash all protected files and write the manifest. Run after legitimate
-    config or rule changes."""
+    config or rule changes.
+
+    `attest=True` (default) signs the manifest with the host's TPM-
+    backed ECDSA key when available, so a stolen manifest can't be
+    replayed on another host. The signature is a no-op on platforms
+    where `tpm_attest.is_available()` is False — the SHA-256 layer is
+    unaffected.
+    """
     root = Path(project_root).resolve()
     cfg = Path(config_path).resolve() if config_path else None
     out = Path(manifest_path) if manifest_path else (root / "data" / MANIFEST_FILENAME)
@@ -83,6 +101,25 @@ def build_manifest(project_root: str | os.PathLike,
         "file_count": len(entries),
         "files": entries,
     }
+
+    if attest:
+        try:
+            from aegis.utils import tpm_attest
+            if tpm_attest.is_available():
+                payload = _canonical_payload(manifest)
+                sig_obj = tpm_attest.sign(payload)
+                if sig_obj is not None:
+                    manifest["attestation"] = sig_obj
+                    logger.info(
+                        f"Manifest TPM-attested via {sig_obj.get('provider')}"
+                    )
+                else:
+                    logger.warning("TPM available but sign() returned None")
+            else:
+                logger.info("TPM not available — manifest is SHA-256 only")
+        except Exception as e:
+            logger.warning(f"Manifest attestation skipped: {e}")
+
     out.write_text(json.dumps(manifest, indent=2))
     logger.info(f"Integrity manifest written: {out} ({len(entries)} files)")
     return manifest
@@ -91,8 +128,17 @@ def build_manifest(project_root: str | os.PathLike,
 def verify_manifest(project_root: str | os.PathLike,
                     config_path: str | os.PathLike | None,
                     manifest_path: str | os.PathLike | None = None,
-                    strict: bool = False) -> tuple[bool, list[str]]:
-    """Return (ok, problems). If strict and no manifest exists, returns False."""
+                    strict: bool = False,
+                    *,
+                    require_attestation: bool = False) -> tuple[bool, list[str]]:
+    """Return (ok, problems). If strict and no manifest exists, returns False.
+
+    `require_attestation=True` rejects an unsigned (or sig-failing)
+    manifest even if every SHA-256 hash matches — for the audit-grade
+    deployment that wants the stronger guarantee. Default False keeps
+    the existing trust model: hashes are mandatory, signature is a
+    layered-on bonus.
+    """
     root = Path(project_root).resolve()
     cfg = Path(config_path).resolve() if config_path else None
     mpath = Path(manifest_path) if manifest_path else (root / "data" / MANIFEST_FILENAME)
@@ -125,6 +171,30 @@ def verify_manifest(project_root: str | os.PathLike,
     for rel in expected:
         if rel not in seen:
             problems.append(f"DELETED: {rel}")
+
+    # Attestation layer — orthogonal to the SHA-256 check above.
+    sig_obj = manifest.get("attestation")
+    if sig_obj:
+        try:
+            from aegis.utils import tpm_attest
+            payload = _canonical_payload(manifest)
+            v = tpm_attest.verify(payload, sig_obj)
+            if not v["ok"]:
+                problems.append(
+                    f"ATTESTATION FAILED: "
+                    f"{v.get('reason') or 'signature/host-binding mismatch'}"
+                )
+            elif not v.get("host_bound_checked"):
+                # Soft-warn: signature math OK, host binding not verified.
+                logger.warning(
+                    "manifest attestation: signature OK but host-binding "
+                    "NOT verified (no TPM on this host)"
+                )
+        except Exception as e:
+            problems.append(f"attestation check failed: {e}")
+    elif require_attestation:
+        problems.append("attestation REQUIRED but manifest has no signature")
+
     return (not problems), problems
 
 

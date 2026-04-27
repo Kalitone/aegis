@@ -83,8 +83,9 @@ rule cryptominer_strings {
         $s7 = "mining.notify" ascii
         $s8 = "coin-hive" ascii nocase
         $wallet = /[13][a-km-zA-HJ-NP-Z1-9]{25,34}/ ascii
-    condition:
-        2 of ($s*) or $wallet
+    // Original condition (kept for reference, replaced below):
+    //     2 of ($s*) or $wallet
+    condition: false and any of them  // DISABLED 2026-04-24: see analysis_reports/01_security.md - produced 100% FP rate; broke condition fires on plain English text. Re-enable only after adding PE/ELF magic gating and removing single-token strings. (`false and any of them` keeps all string defs referenced so yara-python compiles cleanly while still never matching.)
 }
 
 rule reverse_shell_script {
@@ -152,8 +153,9 @@ rule credential_access_file {
         $s6 = "credential" ascii nocase
         $s7 = "password" ascii nocase
         $s8 = "hashdump" ascii nocase
-    condition:
-        3 of them
+    // Original condition (kept for reference, replaced below):
+    //     3 of them
+    condition: false and any of them  // DISABLED 2026-04-24: see analysis_reports/01_security.md - produced 100% FP rate; broke condition fires on plain English text. Re-enable only after adding PE/ELF magic gating and removing single-token strings. (`false and any of them` keeps all string defs referenced so yara-python compiles cleanly while still never matching.)
 }
 
 rule persistence_mechanism {

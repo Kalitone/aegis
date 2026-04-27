@@ -31,18 +31,25 @@ from aegis.monitors.network_mon import NetworkMonitor
 from aegis.monitors.resource_mon import ResourceMonitor
 from aegis.monitors.persistence import PersistenceMonitor
 from aegis.monitors.dns_mon import DnsMonitor
+from aegis.monitors.honey_mon import HoneytokenMonitor
+from aegis.monitors.proc_ebpf import EbpfProcessMonitor
 from aegis.detection.yara_scanner import YaraScanner
 from aegis.detection.behavioral import BehavioralEngine, RULES as BEHAVIORAL_RULES
 from aegis.detection.anomaly import AnomalyDetector
 from aegis.detection.supply_chain import SupplyChainScanner
 from aegis.detection.sigma_loader import load_sigma_rules
 from aegis.detection.threat_intel import ThreatIntel
+from aegis.detection.llm_triage import LlmTriage
+from aegis.detection.amsi import AmsiScanner
 from aegis.response import ResponseEngine
-from aegis.utils.alerting import setup_logging, WebhookAlerter, EmailAlerter, ToastAlerter
+from aegis.utils.alerting import setup_logging, WebhookAlerter, EmailAlerter, ToastAlerter, OcsfFileSink
 from aegis.utils.self_protect import (
     verify_manifest, parent_is_service_host, spawn_watchdog, mark_clean_shutdown,
     build_manifest,
 )
+from aegis.utils.process_mitigation import apply_mitigations
+from aegis.utils.sbom import SbomEmitter
+from aegis.utils.lockfile import acquire_lock, release_lock, LockHeld
 from aegis.dashboard.web import WebDashboard
 
 
@@ -70,7 +77,10 @@ class Aegis:
         # ── Tamper resistance gate (run BEFORE we touch any state) ──
         sp_cfg = self.config.get("self_protect", {}) or {}
         if sp_cfg.get("manifest_check", True):
-            ok, problems = verify_manifest(".", config_path or "config/aegis.yaml")
+            ok, problems = verify_manifest(
+                ".", config_path or "config/aegis.yaml",
+                require_attestation=bool(sp_cfg.get("require_attestation", False)),
+            )
             if not ok:
                 self.logger.error("INTEGRITY CHECK FAILED:\n  - "
                                   + "\n  - ".join(problems))
@@ -84,6 +94,28 @@ class Aegis:
                 self.logger.error("Parent process check failed — refusing to start")
                 raise SystemExit(3)
 
+        # Single-instance guard — prevent dual-writer split-brain on the
+        # event store (NSSM has been observed spawning a second process
+        # before the first fully terminates).
+        self._lock_path = self.config.get("core.lockfile", "data/aegis.pid")
+        try:
+            acquire_lock(self._lock_path)
+        except LockHeld as e:
+            self.logger.error(str(e))
+            raise SystemExit(4)
+
+        # Process mitigations — apply BEFORE the bus / monitors load
+        # any third-party DLLs, so e.g. NoRemoteImages takes effect on
+        # every subsequent ctypes.WinDLL call. Stash the report; we
+        # publish it once the event bus exists below.
+        pm_cfg = self.config.get("self_protect.process_mitigations", {}) or {}
+        if pm_cfg.get("enabled", True):
+            self._mitigation_report = apply_mitigations(
+                aggressive=bool(pm_cfg.get("aggressive", False)),
+            )
+        else:
+            self._mitigation_report = None
+
         # Core
         db_path = self.config.get("core.event_db", "data/events.db")
         self.event_bus = EventBus(db_path=db_path)
@@ -95,6 +127,8 @@ class Aegis:
         self.resmon = ResourceMonitor(self.event_bus, self.config.get("monitors.resource", {}))
         self.persistence = PersistenceMonitor(self.event_bus, self.config.get("monitors.persistence", {}))
         self.dns = DnsMonitor(self.event_bus, self.config.get("monitors.dns", {}))
+        self.honey = HoneytokenMonitor(self.event_bus, self.config.get("monitors.honey", {}))
+        self.proc_ebpf = EbpfProcessMonitor(self.event_bus, self.config.get("monitors.proc_ebpf", {}))
 
         # Detection
         self.yara = YaraScanner(self.event_bus, self.config.get("detection.yara", {}))
@@ -120,6 +154,8 @@ class Aegis:
             self.event_bus, self.config.get("detection.supply_chain", {})
         )
         self.threat_intel = ThreatIntel(self.event_bus, self.config.get("detection.threat_intel", {}))
+        self.llm_triage = LlmTriage(self.event_bus, self.config.get("detection.llm_triage", {}))
+        self.amsi = AmsiScanner(self.event_bus, self.config.get("detection.amsi", {}))
 
         # Response
         self.response = ResponseEngine(self.event_bus, self.config.get("response", {}))
@@ -128,6 +164,8 @@ class Aegis:
         self.webhook = WebhookAlerter(self.event_bus, self.config.get("alerting.webhook", {}))
         self.email = EmailAlerter(self.event_bus, self.config.get("alerting.email", {}))
         self.toast = ToastAlerter(self.event_bus, self.config.get("alerting.toast", {}))
+        self.ocsf = OcsfFileSink(self.event_bus, self.config.get("alerting.ocsf", {}))
+        self.sbom = SbomEmitter(self.event_bus, self.config.get("detection.supply_chain.sbom", {}))
 
         # Web dashboard
         full_cfg = {"core": self.config.get("core", {}),
@@ -146,6 +184,24 @@ class Aegis:
         self.logger.info(f"Python: {platform.python_version()}")
         self.logger.info("=" * 60)
 
+        if self._mitigation_report is not None:
+            applied = self._mitigation_report.get("applied") or []
+            failed = self._mitigation_report.get("failed") or []
+            self.logger.info(
+                f"Process mitigations: applied={applied} "
+                f"failed={[f['label'] for f in failed]}"
+            )
+            self.event_bus.publish(Event(
+                category=EventCategory.SYSTEM_START,
+                severity=Severity.INFO,
+                source="self_protect",
+                hostname=socket.gethostname(),
+                data={
+                    "action": "process_mitigations_applied",
+                    **self._mitigation_report,
+                },
+            ))
+
         self.event_bus.publish(Event(
             category=EventCategory.SYSTEM_START,
             severity=Severity.INFO,
@@ -162,6 +218,7 @@ class Aegis:
         self.webhook.start()
         self.email.start()
         self.toast.start()
+        self.ocsf.start()
 
         self.response.start()
         self.logger.info("✓ Response engine started")
@@ -186,6 +243,9 @@ class Aegis:
         if self.config.get("detection.supply_chain.enabled", True):
             self.supply_chain.start()
             self.logger.info("✓ Supply chain scanner started")
+        if self.config.get("detection.supply_chain.sbom.enabled", False):
+            self.sbom.start()
+            self.logger.info("✓ SBOM emitter started")
 
         if self.config.get("monitors.process.enabled", True):
             self.procmon.start()
@@ -206,9 +266,23 @@ class Aegis:
         if self.config.get("monitors.dns.enabled", True):
             self.dns.start()
             self.logger.info("✓ DNS monitor started")
+        if self.config.get("monitors.honey.enabled", True):
+            self.honey.start()
+            self.logger.info("✓ Honeytoken monitor started")
+        if self.config.get("monitors.proc_ebpf.enabled", False):
+            self.proc_ebpf.start()
+            if self.proc_ebpf.enabled:
+                self.logger.info("✓ eBPF process monitor started")
         if self.config.get("detection.threat_intel.enabled", True):
             self.threat_intel.start()
             self.logger.info("✓ Threat intel feeds started")
+        if self.config.get("detection.llm_triage.enabled", False):
+            self.llm_triage.start()
+            self.logger.info("✓ LLM triage started")
+        if self.config.get("detection.amsi.enabled", True):
+            self.amsi.start()
+            if self.amsi.enabled:
+                self.logger.info("✓ AMSI scanner started")
 
         # Periodic in-memory YARA scan (defaults to every 10 min). On Linux
         # it needs root; on Windows it needs SYSTEM (which the NSSM service is).
@@ -246,6 +320,12 @@ class Aegis:
         # Tell the watchdog this is intentional so it doesn't relaunch us.
         mark_clean_shutdown()
         self._running = False
+        # Drop the single-instance lock early so a fast restart doesn't
+        # see a stale-but-still-our PID race with the new process.
+        try:
+            release_lock(self._lock_path)
+        except Exception as e:
+            self.logger.warning(f"release_lock failed: {e}")
 
         self.fim.stop()
         self.procmon.stop()
@@ -253,13 +333,19 @@ class Aegis:
         self.resmon.stop()
         self.persistence.stop()
         self.dns.stop()
+        self.honey.stop()
+        self.proc_ebpf.stop()
         self.anomaly.stop()
         self.supply_chain.stop()
+        self.sbom.stop()
         self.threat_intel.stop()
+        self.llm_triage.stop()
+        self.amsi.stop()
         self.response.stop()
         self.webhook.stop()
         self.email.stop()
         self.toast.stop()
+        self.ocsf.stop()
         self.web.stop()
         self.event_bus.shutdown()
 
@@ -398,7 +484,11 @@ def _cmd_verify_chain(config: AegisConfig):
 
 
 def _cmd_purge_quarantine(config: AegisConfig, keep_meta: bool = False):
-    """Delete every file under the configured quarantine directory."""
+    """Delete every file under the configured quarantine directory.
+
+    Quarantined files have the readonly bit set by `_quarantine_path`
+    so a careless click can't double-trip on them. On Windows that
+    blocks `Path.unlink`, so we clear the bit first per file."""
     from pathlib import Path
     qdir = Path(config.get("core.quarantine_dir", "quarantine"))
     if not qdir.exists():
@@ -414,6 +504,13 @@ def _cmd_purge_quarantine(config: AegisConfig, keep_meta: bool = False):
             continue
         try:
             freed += entry.stat().st_size
+            try:
+                # Clear the readonly bit set by _quarantine_path so
+                # Windows lets us unlink. Linux ignores this.
+                import os as _os
+                _os.chmod(entry, 0o600)
+            except OSError:
+                pass
             entry.unlink()
             removed += 1
         except Exception:
@@ -488,6 +585,41 @@ def _cmd_mem_scan(config: AegisConfig):
         print("✓ No in-memory YARA matches.")
 
 
+def _cmd_config_check(config_path: str) -> int:
+    """Strict-mode validation of `config_path`. Exits non-zero on
+    failure so CI gates can wedge a bad commit. Prints one line per
+    issue with the dotted field path so the operator can find it."""
+    from pathlib import Path as _Path
+    from aegis.core.config_schema import validate_config_dict
+    import yaml as _yaml
+    p = _Path(config_path)
+    if not p.exists():
+        print(f"✗ Config file not found: {config_path}")
+        return 2
+    try:
+        with p.open("r", encoding="utf-8") as f:
+            data = _yaml.safe_load(f) or {}
+    except Exception as e:
+        print(f"✗ YAML parse error: {e}")
+        return 3
+    errors = validate_config_dict(data)
+    if not errors:
+        print(f"✓ {config_path} validates clean against the schema.")
+        return 0
+    print(f"✗ {len(errors)} validation issue(s) in {config_path}:")
+    for err in errors:
+        print(f"  {err['loc']}: {err['msg']} ({err['type']})")
+    return 5
+
+
+def _cmd_config_schema():
+    """Print the JSON Schema for the AEGIS settings model.
+    Useful to feed an editor's `yaml.schemas` mapping for completion."""
+    import json as _json
+    from aegis.core.config_schema import schema_dict
+    print(_json.dumps(schema_dict(), indent=2))
+
+
 def _cmd_scan_pkg_path(config: AegisConfig, path: str):
     bus = EventBus()
     scanner = SupplyChainScanner(bus, config.get("detection.supply_chain", {}))
@@ -537,7 +669,22 @@ def main():
                              "(anomaly training/quarantine unaffected)")
     parser.add_argument("--yes", action="store_true",
                         help="Skip interactive confirmation (for --reset-chain)")
+    parser.add_argument("--config-check", action="store_true",
+                        help="Strict-validate the config file and exit "
+                             "(non-zero on schema error)")
+    parser.add_argument("--config-schema", action="store_true",
+                        help="Print the JSON Schema of the config and exit")
     args = parser.parse_args()
+
+    # `--config-check` and `--config-schema` run BEFORE constructing
+    # AegisConfig because config construction itself logs warnings on
+    # bad input — we want clean stdout for these.
+    if args.config_schema:
+        _cmd_config_schema()
+        return
+    if args.config_check:
+        rc = _cmd_config_check(args.config)
+        sys.exit(rc)
 
     config = AegisConfig(args.config)
 

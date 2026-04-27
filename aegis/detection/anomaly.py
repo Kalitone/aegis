@@ -23,11 +23,68 @@ import time
 import math
 import logging
 import threading
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
 from aegis.core import EventBus, Event, EventCategory, Severity
 from aegis.monitors.process_mon import cmdline_entropy
+
+
+_SEVERITY_BY_NAME: dict[str, Severity] = {
+    "info": Severity.INFO,
+    "low": Severity.LOW,
+    "medium": Severity.MEDIUM,
+    "high": Severity.HIGH,
+    "critical": Severity.CRITICAL,
+}
+
+
+class _StormBreaker:
+    """Rolling-window rate limiter for anomaly detections.
+
+    Audit found 326 anomaly detections in 6.5 days — most were
+    duplicate score-tail noise rather than distinct incidents. The
+    breaker keeps a deque of recent admit-times; once more than
+    `threshold` events occur inside `window_s`, it trips and silences
+    further detections for `cool_off_s`. The deque drains naturally
+    so the breaker re-arms without external clean-up.
+    """
+
+    def __init__(self, *, threshold: int, window_s: float, cool_off_s: float):
+        self.threshold = max(1, int(threshold))
+        self.window_s = float(window_s)
+        self.cool_off_s = float(cool_off_s)
+        self._times: deque[float] = deque()
+        self._tripped_until: float = 0.0
+        self.trips: int = 0
+        self.suppressed: int = 0
+
+    def try_admit(self, now: float) -> bool:
+        """True to publish, False to suppress."""
+        if now < self._tripped_until:
+            self.suppressed += 1
+            return False
+        cutoff = now - self.window_s
+        while self._times and self._times[0] < cutoff:
+            self._times.popleft()
+        self._times.append(now)
+        if len(self._times) > self.threshold:
+            self._tripped_until = now + self.cool_off_s
+            self.trips += 1
+            self.suppressed += 1
+            return False
+        return True
+
+    def stats(self) -> dict:
+        return {
+            "threshold": self.threshold,
+            "window_s": self.window_s,
+            "cool_off_s": self.cool_off_s,
+            "trips": self.trips,
+            "suppressed": self.suppressed,
+            "tripped": time.time() < self._tripped_until,
+        }
 
 logger = logging.getLogger("aegis.detection.anomaly")
 
@@ -88,6 +145,27 @@ class AnomalyDetector:
         self.training_period_hours = float(config.get("training_period_hours", 24))
         self.min_training_samples = int(config.get("min_training_samples", 200))
         self.auto_train = bool(config.get("auto_train", True))
+
+        # Default severity for an Isolation Forest hit. Audit found that
+        # promoting these to HIGH (the old behaviour for score < -0.2)
+        # mixed score-tail noise into the same channel as YARA matches —
+        # operators couldn't tell signal from drift. Default MEDIUM keeps
+        # them visible without triggering the high-severity action chain.
+        sev_name = str(config.get("severity", "medium")).lower()
+        self._base_severity = _SEVERITY_BY_NAME.get(sev_name, Severity.MEDIUM)
+
+        # Storm breaker: cap how many detections we publish per window.
+        # Disabled by default (None) only if the operator explicitly
+        # turns it off; the audit pretty clearly says we want this on.
+        breaker_cfg = config.get("storm_breaker", {}) or {}
+        if bool(breaker_cfg.get("enabled", True)):
+            self._storm_breaker = _StormBreaker(
+                threshold=int(breaker_cfg.get("threshold", 5)),
+                window_s=float(breaker_cfg.get("window_s", 300)),
+                cool_off_s=float(breaker_cfg.get("cool_off_s", 300)),
+            )
+        else:
+            self._storm_breaker = None
 
         self._lock = threading.Lock()
         self._training_buffer: list[list[float]] = []
@@ -281,16 +359,19 @@ class AnomalyDetector:
                 if now - v < 60
             }
 
+        if self._storm_breaker is not None and not self._storm_breaker.try_admit(now):
+            logger.debug(
+                f"ANOMALY suppressed by storm breaker: "
+                f"score={score:.3f} pid={event.data.get('pid')}"
+            )
+            return
+
         self._detection_count += 1
         self._last_detection_ts = now
-        severity = Severity.MEDIUM
-        # Very low score — deeper in the anomaly tail — escalate.
-        if score < -0.2:
-            severity = Severity.HIGH
 
         self.bus.publish(Event(
             category=EventCategory.DETECTION_ANOMALY,
-            severity=severity,
+            severity=self._base_severity,
             source="anomaly",
             data={
                 "score": score,

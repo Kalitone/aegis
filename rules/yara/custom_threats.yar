@@ -59,8 +59,9 @@ rule ransomware_note {
         $ext1 = ".locked" ascii
         $ext2 = ".encrypted" ascii
         $ext3 = ".crypt" ascii
-    condition:
-        3 of ($r*) or (any of ($ext*) and 2 of ($r*))
+    // Original condition (kept for reference, replaced below):
+    //     3 of ($r*) or (any of ($ext*) and 2 of ($r*))
+    condition: false and any of them  // DISABLED 2026-04-24: see analysis_reports/01_security.md - produced 100% FP rate; broke condition fires on plain English text. Re-enable only after adding PE/ELF magic gating and removing single-token strings. (`false and any of them` keeps all string defs referenced so yara-python compiles cleanly while still never matching.)
 }
 
 rule suspicious_powershell_script {
@@ -106,8 +107,9 @@ rule data_exfil_tool {
         $c2 = "file.io" ascii
         $c3 = "0x0.st" ascii
         $c4 = "paste.ee" ascii
-    condition:
-        any of them
+    // Original condition (kept for reference, replaced below):
+    //     any of them
+    condition: false and any of them  // DISABLED 2026-04-24: see analysis_reports/01_security.md - produced 100% FP rate; broke condition fires on plain English text. Re-enable only after adding PE/ELF magic gating and removing single-token strings. (`false and any of them` keeps all string defs referenced so yara-python compiles cleanly while still never matching.)
 }
 
 rule credential_harvester {
@@ -127,8 +129,9 @@ rule credential_harvester {
         $h2 = "pwdump" ascii nocase
         $h3 = "fgdump" ascii nocase
         $k1 = "keylog" ascii nocase
-    condition:
-        any of ($m*) or any of ($l*) or any of ($h*) or $k1
+    // Original condition (kept for reference, replaced below):
+    //     any of ($m*) or any of ($l*) or any of ($h*) or $k1
+    condition: false and any of them  // DISABLED 2026-04-24: see analysis_reports/01_security.md - produced 100% FP rate; broke condition fires on plain English text. Re-enable only after adding PE/ELF magic gating and removing single-token strings. (`false and any of them` keeps all string defs referenced so yara-python compiles cleanly while still never matching.)
 }
 
 rule suspicious_npm_package {

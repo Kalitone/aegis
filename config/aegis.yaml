@@ -103,6 +103,38 @@ monitors:
     poll_interval_seconds: 30
     sni_capture: false         # set true if scapy + npcap installed
 
+  # ─── eBPF process tracer (Linux only) ──────────────────────
+  # Push-based replacement for the psutil polling above. Hooks the
+  # kernel `sched_process_exec` tracepoint and emits `proc.create`
+  # events with sub-millisecond latency — no missed PIDs from short-
+  # lived fork+exec+exit chains. Soft-fails on non-Linux / missing
+  # bcc / insufficient privileges. Requires CAP_BPF or root.
+  #
+  # IMPORTANT: when this is enabled on a Linux host, set
+  # `monitors.process.enabled: false` to avoid duplicate proc.create
+  # events. On Windows / macOS, leave both at their defaults — the
+  # eBPF monitor self-disables and `process` keeps polling.
+  proc_ebpf:
+    enabled: false
+    ringbuf_pages: 64        # 64 × 4 KB = 256 KB perf-buffer per CPU
+    poll_interval_ms: 100
+
+  # ─── Honeytoken canaries ───────────────────────────────────
+  # Plant decoy files in attacker-attractive locations and watch
+  # for any modification or deletion. Ransomware encrypts every
+  # canary it walks; credential thieves grep `passwords.txt` /
+  # `aws/credentials`. Detection FP rate is essentially zero by
+  # construction. plant_on_start refuses to overwrite pre-existing
+  # files at the canary path — operator data is sacred.
+  honey:
+    enabled: true
+    poll_interval_seconds: 60
+    plant_on_start: true
+    plant_user_dirs: true
+    auto_replant: false        # restore deleted canaries on next poll
+    baseline_path: data/honey.baseline.json
+    extra_canaries: []         # e.g. [{path: D:/share/secrets.txt, template: passwords}]
+
 detection:
   yara:
     enabled: true
@@ -130,6 +162,18 @@ detection:
     min_training_samples: 200
     contamination: 0.01
     auto_train: true
+    # Severity for an Isolation Forest hit. Audit found ~50/day with
+    # most being score-tail noise — keep MEDIUM unless you've tuned the
+    # contamination factor. Values: info | low | medium | high | critical.
+    severity: medium
+    # Storm breaker: cap how many anomaly events publish per window.
+    # When more than `threshold` admit inside `window_s`, suppress
+    # further detections for `cool_off_s`.
+    storm_breaker:
+      enabled: true
+      threshold: 5
+      window_s: 300            # 5 minutes
+      cool_off_s: 300          # silence for 5 minutes once tripped
     features:
       - cpu_percent
       - memory_mb
@@ -143,6 +187,18 @@ detection:
     enabled: true
     typosquat_max_distance: 2
     malicious_db_path: rules/supply_chain/known_malicious.json
+    # ─── Host SBOM (CycloneDX 1.5) ─────────────────────────
+    # Periodically writes a Software Bill of Materials listing
+    # every pip and (globally-installed) npm package on this
+    # host. Output is SIEM/Dependency-Track-friendly JSON. Off
+    # by default; enable when you want supply-chain inventory
+    # for the audit trail.
+    sbom:
+      enabled: false
+      path: data/sbom.cdx.json
+      interval_hours: 24
+      include_npm: true
+      emit_on_start: true
 
   # ─── Sigma rule loader ───────────────────────────────────────
   # Translates a subset of SigmaHQ process_creation rules into
@@ -162,8 +218,74 @@ detection:
     refresh_seconds: 3600
     cache_path: data/threat_intel_cache.json
 
+  # ─── AMSI client (Windows-only) ──────────────────────────────
+  # Hands every script-class file (.ps1, .vbs, .js, .bat, …) written
+  # to a watched path through the host's AMSI providers (Windows
+  # Defender by default) BEFORE it can execute. Defender's verdict
+  # surfaces as a `detection.amsi` event. No-op on non-Windows.
+  # `publish_clean_results: true` floods the bus with INFO-level
+  # scan receipts — keep off unless you specifically want them for
+  # OCSF audit trails.
+  amsi:
+    enabled: true
+    app_name: AEGIS-EDR
+    max_file_size_mb: 16
+    publish_clean_results: false
+    extensions:
+      - .ps1
+      - .psm1
+      - .psd1
+      - .ps1xml
+      - .vbs
+      - .vbe
+      - .js
+      - .jse
+      - .wsf
+      - .wsh
+      - .bat
+      - .cmd
+      - .hta
+      - .lnk
+
+  # ─── Local LLM alert triage ──────────────────────────────────
+  # Subscribes to response.alert and produces a one-paragraph
+  # narrative + confidence label + suggested next steps. Requires
+  # `pip install llama-cpp-python` and a GGUF model file in
+  # models/. Output is ADVISORY ONLY — never feeds destructive
+  # actions. Disabled by default; flip enabled=true once you've
+  # downloaded a model.
+  llm_triage:
+    enabled: false
+    model: qwen-2.5-3b       # qwen-2.5-3b (default) | phi-3.5-mini | llama-3.2-3b | qwen-2.5-7b | phi-4
+    models_dir: models
+    n_ctx: 4096
+    max_tokens_out: 256
+    queue_size: 64
+
 response:
   auto_respond: true
+  # Per-source override of auto_respond. Anomaly detector (source=
+  # "anomaly") defaults to false because Isolation Forest score-tail
+  # hits are too lossy to trigger destructive actions; a manual-action
+  # alert is still published. Other sources fall back to the flag above.
+  auto_respond_sources:
+    anomaly: false
+  # ─── Forensics retention ───────────────────────────────────
+  # Snapshot files (data/forensics/snapshot_*.json) accumulated
+  # to ~340 MB/day in production audit. `purge_expired` now
+  # rotates them alongside quarantine. Snapshots whose case_id
+  # is still referenced by a quarantine meta are protected.
+  forensics:
+    retention_days: 30          # 0 disables forensics rotation
+  # ─── Quarantine allow-list ─────────────────────────────────
+  # Paths the engine will REFUSE to quarantine, even on a high-
+  # severity detection. The defaults already protect Microsoft
+  # OneAuth / TokenBroker, Chrome / Edge / Firefox profiles,
+  # OneDrive, Outlook .ost/.pst, Linux ~/.ssh, ~/.gnupg, etc.
+  # Add deployment-specific paths here (case-insensitive
+  # substring match against the absolute path).
+  quarantine:
+    allow_list_paths: []        # e.g. ["\\company\\creds\\", "/opt/secret/"]
   severity_actions:
     critical:
       - kill_process
@@ -204,6 +326,23 @@ self_protect:
   strict: false
   parent_check: false
   watchdog: false
+  # `require_attestation`: when true, an integrity manifest without a
+  # valid TPM-bound ECDSA signature is rejected even if every SHA-256
+  # hash matches. Turn on once you've built a manifest on a host with
+  # a working TPM (Windows 8+ Platform Crypto Provider). Off by default
+  # so existing SHA-256 manifests keep working through rollout.
+  require_attestation: false
+  # ─── Process mitigation policies (Windows) ─────────────────
+  # Calls SetProcessMitigationPolicy at bootstrap to harden AEGIS's
+  # own surface. Safe-by-default bundle: ExtensionPointDisable,
+  # StrictHandleCheck, ImageLoad (NoRemote/NoLowLabel/PreferSystem32),
+  # FontDisable. No-op on non-Windows. `aggressive` adds
+  # ProhibitDynamicCode + NoChildProcessCreation — these BREAK
+  # subprocess.run usage in --harden, persistence monitor, hardening
+  # recheck. Only enable when those are run from a separate process.
+  process_mitigations:
+    enabled: true
+    aggressive: false
 
 # ─── Daily rule auto-update ───────────────────────────────────
 rule_updates:
@@ -214,6 +353,21 @@ rule_updates:
 # Webhook: Slack, Discord, Teams, or any JSON-receiving endpoint.
 # Email:   SMTP — leave smtp_host blank to disable.
 alerting:
+  # ─── OCSF v1.1.0 export ────────────────────────────────────
+  # Writes every AEGIS event in OCSF JSON-lines for SIEM ingest
+  # (Splunk Forwarder / Filebeat / Vector tailing the file). The
+  # full event stream — not just alerts — so the hash-chained log
+  # is portable as an audit artifact. Off by default; enable when
+  # you've decided where to drain the file.
+  ocsf:
+    enabled: false
+    path: logs/ocsf.json
+    max_bytes: 10485760       # 10 MB per rotation
+    backup_count: 7
+    product_name: AEGIS
+    product_vendor: AEGIS
+    product_version: "0.2.0"
+    schema_version: "1.1.0"
   webhook:
     url: ""                   # e.g. https://hooks.slack.com/services/...
     style: generic            # generic | slack | discord | teams

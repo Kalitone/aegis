@@ -4,14 +4,17 @@ AEGIS Web Dashboard — Operator Console
 FastAPI + HTMX + Alpine.js. Loopback only, single operator, no auth.
 
 Routes:
-  /                      live event stream + inspector
+  /                      live event stream + inspector (SSE-driven)
   /findings              detection table, multi-select bulk actions
+  /cases                 case rollup grouped by case_id
+  /cases/{case_id}       single-case event timeline
   /quarantine            quarantined files, typed-confirm purge
   /coverage              MITRE ATT&CK matrix
   /integrity             chain + manifest verifier
   /static/aegis.css      single stylesheet
   /api/statusbar         top status bar HTML (poll 2s)
-  /api/events            event stream rows HTML (poll 1s)
+  /api/events            event stream rows HTML (one-shot history)
+  /api/events/stream     SSE push stream for the live page
   /api/event/{id}        inspector pane HTML for a single event
   /api/sparkline         inline-SVG event-rate sparkline
   /api/health            JSON health snapshot
@@ -21,6 +24,7 @@ Routes:
 
 from __future__ import annotations
 
+import os
 import json
 import time
 import socket
@@ -33,8 +37,8 @@ from aegis.core import EventBus
 logger = logging.getLogger("aegis.dashboard.web")
 
 try:
-    from fastapi import FastAPI, Form, HTTPException
-    from fastapi.responses import HTMLResponse, JSONResponse, Response
+    from fastapi import FastAPI, Form, HTTPException, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
     import uvicorn
     FASTAPI_AVAILABLE = True
 except ImportError:
@@ -405,10 +409,42 @@ def _short(s, n=80) -> str:
     return s if len(s) <= n else s[:n-1] + "…"
 
 
+def _render_event_row(r: dict) -> str:
+    """Render one event as the live-stream `<tr>` HTML.
+
+    Shared by the REST `/api/events` initial-load endpoint and the
+    SSE `/api/events/stream` push endpoint so both produce the
+    exact same DOM and the page's filter chips don't have to know
+    where a row came from.
+    """
+    sev = (r.get("severity") or "info").lower()
+    data_str = r.get("data") or ""
+    try:
+        d = json.loads(data_str) if isinstance(data_str, str) else data_str
+    except (TypeError, json.JSONDecodeError):
+        d = {}
+    summary = (d.get("path") or d.get("cmdline") or d.get("process")
+               or d.get("rule_name") or d.get("name") or "")
+    text = (str(r.get("source", "")) + " " + str(r.get("category", "")) + " "
+            + str(summary)).lower()
+    return (
+        f'<tr class="sev-{sev}" data-sev="{sev}" data-eid="{_esc(r.get("event_id",""))}" '
+        f'data-text="{_esc(text)}" '
+        f'onclick="window.aegisInst && window.aegisInst.selectRow(this)">'
+        f'<td><span class="ts">{_ts(r["timestamp"])}</span></td>'
+        f'<td>{_sev(sev)}</td>'
+        f'<td><span class="cat">{_esc(r.get("category",""))}</span></td>'
+        f'<td>{_esc(r.get("source",""))}</td>'
+        f'<td class="path wide">{_esc(_short(summary, 200))}</td>'
+        f'</tr>'
+    )
+
+
 def _rail(active: str) -> str:
     items = [
         ("/",            "live",        "Live", ICON_LIVE),
         ("/findings",    "findings",    "Findings", ICON_FIND),
+        ("/cases",       "cases",       "Cases", ICON_FIND),
         ("/quarantine",  "quarantine",  "Quarantine", ICON_QUAR),
         ("/coverage",    "coverage",    "Coverage", ICON_COV),
         ("/integrity",   "integrity",   "Integrity", ICON_INTG),
@@ -557,7 +593,8 @@ def create_app(event_bus: EventBus, config: dict, aegis_ref=None):
   <h2>Live · Event Stream</h2>
   <span class="meta" id="stream-meta">—</span>
   <div class="tools">
-    <span class="meta" x-text="paused ? 'PAUSED' : 'LIVE'"></span>
+    <span class="meta" id="stream-conn">connecting…</span>
+    <button id="pause-btn">Pause</button>
   </div>
 </div>
 <div class="filter">
@@ -568,31 +605,279 @@ def create_app(event_bus: EventBus, config: dict, aegis_ref=None):
   <span class="chip"    data-sev="info"     onclick="this.classList.toggle('on'); refilter()">[I] Info</span>
   <input class="filter-input" type="text" placeholder="regex / substring filter (path, cmdline, source)…" oninput="refilter()" id="ftext">
 </div>
-<div class="scroll" id="stream-scroll"
-     hx-get="/api/events?limit=120" hx-trigger="load, every 1s [!htmx.config.paused]"
-     hx-swap="innerHTML" hx-on::after-swap="refilter()">
-  <div class="empty">loading…</div>
+<div class="scroll" id="stream-scroll">
+  <table class="table">
+    <thead><tr>
+      <th style="width:90px">Time</th>
+      <th style="width:40px">Sev</th>
+      <th style="width:220px">Category</th>
+      <th style="width:130px">Source</th>
+      <th>Summary</th>
+    </tr></thead>
+    <tbody id="stream-tbody">
+      <tr><td colspan="5"><div class="empty">loading history…</div></td></tr>
+    </tbody>
+  </table>
 </div>
 <script>
-function refilter() {
-  const on = [...document.querySelectorAll('.chip.on')].map(c => c.dataset.sev);
-  const q = (document.getElementById('ftext')?.value || '').toLowerCase();
-  document.querySelectorAll('table.table tbody tr').forEach(tr => {
-    const sev = tr.dataset.sev;
-    const txt = tr.dataset.text || '';
-    const ok = on.includes(sev) && (!q || txt.includes(q));
-    tr.style.display = ok ? '' : 'none';
+(function() {
+  const tbody = document.getElementById('stream-tbody');
+  const conn  = document.getElementById('stream-conn');
+  const meta  = document.getElementById('stream-meta');
+  const btn   = document.getElementById('pause-btn');
+  const MAX_ROWS = 200;
+  let es = null;
+  let paused = false;
+  let received = 0;
+
+  function setConn(text, ok) {
+    if (!conn) return;
+    conn.textContent = text;
+    conn.style.color = ok ? 'var(--green)' : 'var(--amber)';
+  }
+
+  function refilter() {
+    const on = [...document.querySelectorAll('.chip.on')].map(c => c.dataset.sev);
+    const q = (document.getElementById('ftext')?.value || '').toLowerCase();
+    document.querySelectorAll('table.table tbody tr').forEach(tr => {
+      if (!tr.dataset.sev) return;
+      const sev = tr.dataset.sev;
+      const txt = tr.dataset.text || '';
+      const ok = on.includes(sev) && (!q || txt.includes(q));
+      tr.style.display = ok ? '' : 'none';
+    });
+  }
+  window.refilter = refilter;
+
+  function bumpMeta() {
+    meta.textContent = received + ' events';
+  }
+
+  // Initial history fetch — same endpoint the old polling used, just one-shot.
+  fetch('/api/events?limit=120').then(r => r.text()).then(html => {
+    const tmp = document.createElement('div');
+    tmp.innerHTML = html;
+    const newBody = tmp.querySelector('tbody');
+    if (newBody) {
+      tbody.innerHTML = newBody.innerHTML;
+      received = tbody.querySelectorAll('tr[data-sev]').length;
+      bumpMeta();
+    }
+    refilter();
+  }).catch(() => {});
+
+  function open() {
+    if (es) { try { es.close(); } catch(_) {} }
+    setConn('connecting…', false);
+    es = new EventSource('/api/events/stream');
+    es.onopen = () => setConn('LIVE', true);
+    es.onerror = () => setConn('reconnect…', false);
+    es.onmessage = (msg) => {
+      let payload;
+      try { payload = JSON.parse(msg.data); } catch (_) { return; }
+      if (!payload.html) return;
+      const tmp = document.createElement('tbody');
+      tmp.innerHTML = payload.html;
+      const tr = tmp.querySelector('tr');
+      if (!tr) return;
+      // Drop the "loading history" placeholder if present.
+      const placeholder = tbody.querySelector('tr td .empty');
+      if (placeholder) tbody.innerHTML = '';
+      tbody.insertBefore(tr, tbody.firstChild);
+      received++;
+      while (tbody.querySelectorAll('tr[data-sev]').length > MAX_ROWS) {
+        tbody.removeChild(tbody.lastChild);
+      }
+      bumpMeta();
+      refilter();
+    };
+  }
+  open();
+
+  btn.addEventListener('click', () => {
+    paused = !paused;
+    btn.textContent = paused ? 'Resume' : 'Pause';
+    if (paused) {
+      if (es) { try { es.close(); } catch(_) {} es = null; }
+      setConn('PAUSED', false);
+    } else {
+      open();
+    }
   });
-}
-// Hover-pause on the stream container
-const sc = document.getElementById('stream-scroll');
-if (sc) {
-  sc.addEventListener('mouseenter', () => htmx.config.paused = true);
-  sc.addEventListener('mouseleave', () => htmx.config.paused = false);
-}
+
+  // Hover-pause: temporarily close the stream so the page doesn't
+  // scroll while the operator inspects a row.
+  const sc = document.getElementById('stream-scroll');
+  if (sc) {
+    sc.addEventListener('mouseenter', () => {
+      if (!paused && es) { try { es.close(); } catch(_) {} es = null; setConn('hover-pause', false); }
+    });
+    sc.addEventListener('mouseleave', () => {
+      if (!paused && !es) { open(); }
+    });
+  }
+})();
 </script>
 """
         return _layout("live", body)
+
+    # ── Page: Cases (event groupings by case_id) ──────────────────
+    @app.get("/cases", response_class=HTMLResponse)
+    def cases_page(window_h: float = 24.0):
+        since = time.time() - max(0.1, window_h) * 3600
+        cases = event_bus.list_cases(since=since, limit=500)
+        rows = []
+        for c in cases:
+            sev = c["highest_severity"]
+            rows.append(
+                f'<tr class="sev-{sev}" data-sev="{sev}" '
+                f'data-text="{_esc((c["case_id"] + " " + (c["rule_name"] or "") + " " + (c["original_path"] or "")).lower())}" '
+                f'onclick="location.href=\'/cases/{_esc(c["case_id"])}\'">'
+                f'<td><span class="ts">{_ts_full(c["last_ts"])}</span></td>'
+                f'<td>{_sev(sev)}</td>'
+                f'<td><span class="cat">{_esc(c["case_id"][:12])}</span></td>'
+                f'<td>{_esc(c["rule_name"] or "—")}</td>'
+                f'<td>{_esc(", ".join(c["sources"]) or "—")}</td>'
+                f'<td>{c["events"]}</td>'
+                f'<td>{_esc(c["mitre_attack"] or "—")}</td>'
+                f'<td class="path wide">{_esc(_short(c["original_path"] or "—", 200))}</td>'
+                f'</tr>'
+            )
+        body = f"""
+<div class="page-head">
+  <h2>Cases · Recent</h2>
+  <span class="meta">{len(cases)} case(s) · last {window_h:g} h</span>
+  <div class="tools">
+    <a href="/cases?window_h=1"  class="chip">1h</a>
+    <a href="/cases?window_h=24" class="chip">24h</a>
+    <a href="/cases?window_h=168" class="chip">7d</a>
+  </div>
+</div>
+<div class="filter">
+  <input class="filter-input" type="text"
+         placeholder="filter (case id, rule, target)…"
+         oninput="filterCases(this.value)">
+</div>
+<div class="scroll">
+<table class="table">
+<thead><tr>
+  <th style="width:160px">Last seen</th>
+  <th style="width:40px">Sev</th>
+  <th style="width:130px">Case</th>
+  <th style="width:200px">Rule</th>
+  <th style="width:160px">Sources</th>
+  <th style="width:60px">Events</th>
+  <th style="width:90px">ATT&amp;CK</th>
+  <th>Target</th>
+</tr></thead>
+<tbody>{''.join(rows) or '<tr><td colspan="8"><div class="empty">No cases in window.</div></td></tr>'}</tbody>
+</table>
+</div>
+<script>
+function filterCases(q) {{
+  q = (q || '').toLowerCase();
+  document.querySelectorAll('table.table tbody tr').forEach(tr => {{
+    if (!tr.dataset.text) return;
+    tr.style.display = (!q || tr.dataset.text.includes(q)) ? '' : 'none';
+  }});
+}}
+</script>
+"""
+        return _layout("cases", body)
+
+    @app.get("/cases/{case_id}", response_class=HTMLResponse)
+    def case_detail(case_id: str):
+        events = event_bus.query_case_events(case_id, limit=2000)
+        if not events:
+            body = f"""
+<div class="page-head"><h2>Case · {_esc(case_id)}</h2></div>
+<div class="empty">No events found for this case.</div>
+"""
+            return _layout("cases", body)
+
+        first = events[0]
+        last = events[-1]
+        highest_sev = "info"
+        rule_seen = ""
+        target_seen = ""
+        mitre_seen = ""
+        sources_seen: set[str] = set()
+        rows = []
+        for r in events:
+            sev = (r.get("severity") or "info").lower()
+            if SEV_RANK.get(sev, 0) > SEV_RANK.get(highest_sev, 0):
+                highest_sev = sev
+            data_str = r.get("data") or ""
+            try:
+                d = json.loads(data_str) if isinstance(data_str, str) else data_str
+            except (TypeError, json.JSONDecodeError):
+                d = {}
+            summary = (d.get("action") or d.get("rule_name") or d.get("rule")
+                       or d.get("path") or d.get("original_path")
+                       or d.get("cmdline") or "")
+            if not rule_seen and (d.get("rule_name") or d.get("rule")):
+                rule_seen = d.get("rule_name") or d.get("rule")
+            if not target_seen:
+                target_seen = (d.get("original_path") or d.get("filepath")
+                               or d.get("path") or "")
+            if not mitre_seen and r.get("mitre_attack"):
+                mitre_seen = r.get("mitre_attack")
+            sources_seen.add(r.get("source") or "")
+            rows.append(
+                f'<tr class="sev-{sev}" data-eid="{_esc(r.get("event_id",""))}" '
+                f'onclick="window.aegisInst && window.aegisInst.selectRow(this)">'
+                f'<td><span class="ts">{_ts_full(r["timestamp"])}</span></td>'
+                f'<td>{_sev(sev)}</td>'
+                f'<td><span class="cat">{_esc(r.get("category",""))}</span></td>'
+                f'<td>{_esc(r.get("source",""))}</td>'
+                f'<td class="path wide">{_esc(_short(summary, 240))}</td>'
+                f'</tr>'
+            )
+
+        sources_str = ", ".join(sorted(s for s in sources_seen if s)) or "—"
+        body = f"""
+<div class="page-head">
+  <h2>Case · {_esc(case_id)}</h2>
+  <span class="meta">
+    {len(events)} events ·
+    {_ts_full(first["timestamp"])} → {_ts_full(last["timestamp"])} ·
+    highest <b>{_esc(highest_sev)}</b> ·
+    sources <b>{_esc(sources_str)}</b>
+  </span>
+</div>
+<div class="page-head" style="opacity:.85; padding-top:0">
+  <span class="meta">Rule: <b>{_esc(rule_seen or "—")}</b></span>
+  <span class="meta">ATT&amp;CK: <b>{_esc(mitre_seen or "—")}</b></span>
+  <span class="meta">Target: <b>{_esc(_short(target_seen or "—", 160))}</b></span>
+  <div class="tools">
+    <a href="/cases" class="chip">← All cases</a>
+  </div>
+</div>
+<div class="scroll">
+<table class="table">
+<thead><tr>
+  <th style="width:160px">Time</th>
+  <th style="width:40px">Sev</th>
+  <th style="width:220px">Category</th>
+  <th style="width:130px">Source</th>
+  <th>Detail</th>
+</tr></thead>
+<tbody>{''.join(rows)}</tbody>
+</table>
+</div>
+<script>
+window.aegisInst = window.aegisInst || {{ selectRow: el => {{
+  document.querySelectorAll('tr.sel').forEach(r => r.classList.remove('sel'));
+  el.classList.add('sel');
+  const id = el.dataset.eid;
+  if (id) {{
+    htmx.ajax('GET', '/api/event/' + id, {{target:'#inspector', swap:'innerHTML'}});
+    document.querySelector('.inspector').classList.add('open');
+  }}
+}}}};
+</script>
+"""
+        return _layout("cases", body)
 
     # ── Page: Findings (detection table) ──────────────────────────
     @app.get("/findings", response_class=HTMLResponse)
@@ -786,13 +1071,23 @@ function filterFindings(q){{
 """
         return _layout("quarantine", body)
 
+    def _force_unlink(p: Path) -> None:
+        """Quarantined files are chmod 000 by `_quarantine_path` so a
+        careless click can't double-trip on them; on Windows that's
+        the readonly bit, which blocks `Path.unlink`. Clear it first."""
+        try:
+            os.chmod(p, 0o600)
+        except OSError:
+            pass
+        p.unlink()
+
     @app.post("/quarantine/delete", response_class=HTMLResponse)
     def quarantine_delete(name: str = Form(...)):
         if "/" in name or "\\" in name or ".." in name:
             return HTMLResponse('<span class="bad">invalid name</span>', status_code=400)
         target = quarantine_dir / name
         try:
-            target.unlink()
+            _force_unlink(target)
             return HTMLResponse(f'<span class="ok">deleted</span>')
         except OSError as e:
             return HTMLResponse(f'<span class="bad">{_esc(e)}</span>', status_code=500)
@@ -802,18 +1097,24 @@ function filterFindings(q){{
         if confirm != "PURGE":
             raise HTTPException(400, "confirmation token mismatch")
         removed = failed = 0
+        first_error: str = ""
         if quarantine_dir.exists():
             for p in quarantine_dir.iterdir():
                 if not p.is_file():
                     continue
                 try:
-                    p.unlink(); removed += 1
-                except Exception:
+                    _force_unlink(p)
+                    removed += 1
+                except Exception as e:
                     failed += 1
+                    if not first_error:
+                        first_error = f"{p.name}: {e}"
         # Re-render the page after purge
+        msg = f"Purged {removed}, failed {failed}."
+        if first_error:
+            msg += f" First error: {first_error}"
         return HTMLResponse(
-            f'<meta http-equiv="refresh" content="0;url=/quarantine">'
-            f'Purged {removed}, failed {failed}.'
+            f'<meta http-equiv="refresh" content="0;url=/quarantine">{_esc(msg)}'
         )
 
     # ── Page: MITRE coverage matrix ───────────────────────────────
@@ -827,11 +1128,12 @@ function filterFindings(q){{
                 f'<div class="page-head"><h2>Coverage</h2></div>'
                 f'<div class="empty">error: {_esc(e)}</div>')
 
-        # Volume of recent fires per technique (last 24h)
+        # Volume of recent fires per technique (last 24h) — only open detections
         fires: dict[str, int] = {}
         try:
             since = time.time() - 86400
-            for r in event_bus.query_events(since=since, limit=10000):
+            for r in event_bus.query_events(since=since, limit=10000,
+                                            ack_state="open"):
                 tid = r.get("mitre_attack") or ""
                 if tid:
                     fires[tid] = fires.get(tid, 0) + 1
@@ -941,7 +1243,8 @@ function filterFindings(q){{
         # unacked criticals (last hour)
         try:
             crit = len(event_bus.query_events(severity="critical",
-                                              since=time.time()-3600, limit=10000))
+                                              since=time.time()-3600, limit=10000,
+                                              ack_state="open"))
         except Exception:
             crit = 0
         # uptime
@@ -979,30 +1282,11 @@ function filterFindings(q){{
 
     @app.get("/api/events", response_class=HTMLResponse)
     def api_events(limit: int = 120, severity: str | None = None):
-        rows = event_bus.query_events(severity=severity, limit=limit)
-        out = []
-        for r in rows:
-            sev = (r.get("severity") or "info").lower()
-            data_str = r.get("data") or ""
-            try:
-                d = json.loads(data_str) if isinstance(data_str, str) else data_str
-            except Exception:
-                d = {}
-            summary = (d.get("path") or d.get("cmdline") or d.get("process")
-                       or d.get("rule_name") or d.get("name") or "")
-            text = (str(r.get("source","")) + " " + str(r.get("category","")) + " "
-                    + str(summary)).lower()
-            out.append(
-                f'<tr class="sev-{sev}" data-sev="{sev}" data-eid="{_esc(r.get("event_id",""))}" '
-                f'data-text="{_esc(text)}" '
-                f'onclick="window.aegisInst && window.aegisInst.selectRow(this)">'
-                f'<td><span class="ts">{_ts(r["timestamp"])}</span></td>'
-                f'<td>{_sev(sev)}</td>'
-                f'<td><span class="cat">{_esc(r.get("category",""))}</span></td>'
-                f'<td>{_esc(r.get("source",""))}</td>'
-                f'<td class="path wide">{_esc(_short(summary, 200))}</td>'
-                f'</tr>'
-            )
+        # 'open' filter drops ack/dismissed detections — non-detection rows
+        # (file/proc/net/etc.) have NULL ack_state and still show.
+        rows = event_bus.query_events(severity=severity, limit=limit,
+                                      ack_state="open")
+        out = [_render_event_row(r) for r in rows]
         return HTMLResponse(f"""
 <table class="table">
 <thead><tr><th style="width:90px">Time</th><th style="width:40px">Sev</th>
@@ -1021,6 +1305,80 @@ window.aegisInst = window.aegisInst || {{ selectRow: el => {{
 }}}};
 </script>
 """)
+
+    @app.get("/api/events/stream")
+    async def api_events_stream(request: Request):
+        """Server-Sent Events stream of live AEGIS events.
+
+        Replaces the old 1-second `/api/events` polling on the live
+        page. One queue per client; when full we drop (publishers
+        must never block the bus). Each frame carries the rendered
+        HTML row plus minimal metadata so the client can prepend
+        without re-fetching.
+        """
+        import asyncio
+        from queue import Queue, Empty
+
+        client_queue: Queue = Queue(maxsize=500)
+
+        def _push(ev):
+            try:
+                client_queue.put_nowait(ev)
+            except Exception:
+                # queue.Full or anything else — never propagate to the bus.
+                pass
+
+        event_bus.subscribe("*", _push)
+
+        async def gen():
+            # `retry: 3000` tells EventSource to reconnect after 3s if dropped.
+            yield "retry: 3000\n\n"
+            yield ": connected\n\n"
+            last_traffic = time.time()
+            try:
+                while True:
+                    if await request.is_disconnected():
+                        return
+                    try:
+                        ev = await asyncio.to_thread(client_queue.get, True, 1.0)
+                    except Empty:
+                        # Heartbeat keeps proxies / browsers from idle-closing.
+                        if time.time() - last_traffic > 15:
+                            last_traffic = time.time()
+                            yield ": keepalive\n\n"
+                        continue
+                    row = {
+                        "event_id": ev.event_id,
+                        "timestamp": ev.timestamp,
+                        "category": (ev.category.value
+                                     if hasattr(ev.category, "value")
+                                     else str(ev.category)),
+                        "severity": (ev.severity.value
+                                     if hasattr(ev.severity, "value")
+                                     else str(ev.severity)),
+                        "source": ev.source,
+                        "data": json.dumps(ev.data or {}, default=str),
+                        "ack_state": None,
+                    }
+                    payload = {
+                        "id": ev.event_id,
+                        "sev": row["severity"],
+                        "html": _render_event_row(row),
+                    }
+                    yield f"data: {json.dumps(payload)}\n\n"
+                    last_traffic = time.time()
+            finally:
+                event_bus.unsubscribe("*", _push)
+
+        return StreamingResponse(
+            gen(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                # Tell nginx-style proxies not to buffer the stream.
+                "X-Accel-Buffering": "no",
+            },
+        )
 
     @app.post("/api/events/ack", response_class=HTMLResponse)
     def api_events_ack(ids: str = Form(...), state: str = Form("ack")):

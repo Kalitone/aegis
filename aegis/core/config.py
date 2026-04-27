@@ -4,11 +4,14 @@ AEGIS Configuration Manager
 Loads YAML config, provides typed access, handles defaults.
 """
 
+import copy
 import yaml
 import logging
 import platform
 from pathlib import Path
 from typing import Any
+
+from aegis.core.config_schema import validate_config_dict
 
 logger = logging.getLogger("aegis.core.config")
 
@@ -106,10 +109,22 @@ DEFAULTS = {
 class AegisConfig:
     """Configuration container with dot-notation access."""
 
-    def __init__(self, config_path: str | None = None):
-        self._data = dict(DEFAULTS)
+    def __init__(self, config_path: str | None = None,
+                 *, validate_strict: bool = False):
+        """
+        validate_strict — when True, a schema validation error raises
+        SystemExit(5). When False (default), errors are logged at
+        WARNING and startup continues. Use the strict mode in CI / via
+        `python -m aegis --config-check`.
+        """
+        # Deep-copy: a shallow `dict(DEFAULTS)` shares nested dicts, so a
+        # second AegisConfig (or a deep-merge from YAML) mutates the
+        # module-level DEFAULTS for every later instance — visible only
+        # under repeated construction (e.g. the test suite).
+        self._data = copy.deepcopy(DEFAULTS)
         self._config_path = config_path
         self._platform = platform.system().lower()  # 'windows', 'linux', 'darwin'
+        self._validation_errors: list[dict] = []
 
         if config_path and Path(config_path).exists():
             self._load(config_path)
@@ -118,6 +133,7 @@ class AegisConfig:
             logger.warning("No config file found, using defaults")
 
         self._apply_platform_defaults()
+        self._validate(strict=validate_strict)
 
     def _load(self, path: str):
         """Load and merge YAML config over defaults."""
@@ -153,6 +169,30 @@ class AegisConfig:
                     "/etc", "/usr/bin", "/usr/local/bin",
                     "/Users", "/tmp",
                 ]
+
+    def _validate(self, *, strict: bool):
+        """Run the merged config through the Pydantic schema.
+
+        Soft-fail by default — a typo logs a warning and the engine
+        starts on the un-validated dict (so existing user configs
+        keep working through the rollout). Strict-fail raises
+        SystemExit(5) so `--config-check` and CI gates can fail.
+        """
+        self._validation_errors = validate_config_dict(self._data)
+        if not self._validation_errors:
+            return
+        for err in self._validation_errors:
+            logger.warning(
+                f"config validation: {err['loc']}: {err['msg']} "
+                f"({err['type']})"
+            )
+        if strict:
+            raise SystemExit(5)
+
+    @property
+    def validation_errors(self) -> list[dict]:
+        """Last `_validate()` call's findings. Empty when clean."""
+        return list(self._validation_errors)
 
     def get(self, dotpath: str, default: Any = None) -> Any:
         """

@@ -72,7 +72,10 @@ logs/
 data/events.db
 data/events.db-wal
 data/events.db-shm
+# Backups: catches both the dated *directories* created by --reset-chain AND
+# the single corrupt files that survive a split-brain incident (operator PII).
 data/events.db.bak-*/
+data/events.db.bak-*
 
 # Anomaly model + training checkpoint (per-host baseline)
 data/anomaly_model.pkl
@@ -103,9 +106,24 @@ data/baseline.db-journal
 # Self-protect clean-shutdown marker
 data/.aegis_clean_shutdown
 
+# Single-instance startup lockfile (PID of the running AEGIS process)
+data/aegis.pid
+
+# Honeytoken canary baseline — per-host paths + sentinel UUIDs
+data/honey.baseline.json
+
+# SBOM output (auto-regenerates; CycloneDX 1.5)
+data/sbom.cdx.json
+
 # Stray data files
 data/*.tmp
 data/*.bak
+
+# ── Local LLM models (operator downloads — multi-GB GGUFs) ─────────
+# Refetch from Hugging Face per analysis_reports/04_llm_bench.md;
+# never check binaries this size into git, GitHub rejects >100 MB.
+models/
+*.gguf
 
 # ── NSSM / Windows service artefacts ────────────────────────────────
 service.out.log

@@ -379,6 +379,12 @@ def test_yara_detects_reverse_shell_script():
     results.ok(f"YARA detects reverse shell: {[m.rule for m in matches]}")
 
 def test_yara_detects_cryptominer():
+    # The `cryptominer_strings` rule was disabled 2026-04-24 after the
+    # production audit (analysis_reports/01_security.md) found a 100%
+    # false-positive rate against Chrome IndexedDB wallet blobs. Re-enable
+    # only after PE/ELF magic gating + removal of single-token strings.
+    # Until then this test asserts the rule stays SILENT on its old
+    # positive sample so a future re-enable can flip the assertion.
     import yara
     from aegis.detection.yara_scanner import BUILTIN_RULES
     rules = yara.compile(source=BUILTIN_RULES)
@@ -387,8 +393,12 @@ def test_yara_detects_cryptominer():
         matches = rules.match(path)
     finally:
         os.unlink(path)
-    assert len(matches) >= 1, "YARA did not detect cryptominer config"
-    results.ok(f"YARA detects cryptominer: {[m.rule for m in matches]}")
+    rule_names = [m.rule for m in matches]
+    assert "cryptominer_strings" not in rule_names, (
+        f"cryptominer_strings unexpectedly fired — was the rule re-enabled "
+        f"without restoring this test? matches={rule_names}"
+    )
+    results.ok(f"YARA cryptominer rule correctly disabled (matches={rule_names})")
 
 def test_yara_no_false_positive():
     import yara
