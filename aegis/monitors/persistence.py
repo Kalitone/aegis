@@ -69,14 +69,22 @@ LINUX_PERSISTENCE_DIRS = [
 
 
 def _run(cmd: list[str], timeout: int = 30) -> str:
-    """Run a command, return stdout (or empty on failure)."""
+    """Run a command, return stdout (or empty on failure).
+
+    Catches OSError explicitly — Windows raises this when the
+    ChildProcessPolicy.NoChildProcessCreation mitigation is active,
+    which blocks all subprocess creation.
+    """
     try:
         res = subprocess.run(
             cmd, capture_output=True, text=True, timeout=timeout,
             errors="ignore",
         )
         return res.stdout or ""
-    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+    except OSError as e:
+        logger.warning(f"Subprocess blocked (process mitigations active?): {e}")
+        return ""
+    except (subprocess.TimeoutExpired, FileNotFoundError) as e:
         logger.debug(f"persistence command failed {cmd[0]}: {e}")
         return ""
 

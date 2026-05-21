@@ -1,0 +1,10 @@
+AEGIS Dashboard — Static JS Dependencies
+=========================================
+
+The dashboard requires two JS files for air-gapped operation.
+Download them during install and place them in this directory:
+
+  htmx.min.js    — https://unpkg.com/htmx.org@1.9.10/dist/htmx.min.js
+  alpine.min.js  — https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js
+
+Without these files the dashboard UI will not function.

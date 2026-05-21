@@ -520,6 +520,10 @@ class LlmTriage:
             else Severity.MEDIUM if result.confidence == "suspicious"
             else Severity.LOW
         )
+        # Uses DETECTION_BEHAVIORAL (not a dedicated category) because LLM
+        # triage is advisory enrichment, not a standalone detector. Keyed
+        # by source="llm_triage" and data.advisory=True so queries can
+        # filter it out of real behavioral detection counts.
         self.bus.publish(Event(
             category=EventCategory.DETECTION_BEHAVIORAL,
             severity=sev_for_event,

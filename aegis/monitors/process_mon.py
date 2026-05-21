@@ -154,6 +154,19 @@ SUSPICIOUS_PATTERNS = [
     # LD_PRELOAD hijacking
     "LD_PRELOAD",
     "ld.so.preload",
+    # Windows LOLBin abuse
+    "certutil -urlcache",
+    "certutil -split",
+    "mshta http",
+    "mshta javascript",
+    "mshta vbscript",
+    "regsvr32 /s /i:http",
+    "rundll32 javascript",
+    "rundll32 shell32",
+    "bitsadmin /transfer",
+    "powershell -enc",
+    "powershell -EncodedCommand",
+    "wmic process call create",
 ]
 
 

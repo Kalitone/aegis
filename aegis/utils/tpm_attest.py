@@ -41,7 +41,10 @@ from __future__ import annotations
 
 import base64
 import ctypes
-import ctypes.wintypes as wintypes
+try:
+    import ctypes.wintypes as wintypes
+except (ImportError, ValueError):
+    wintypes = None  # Non-Windows; TPM functions check is_available() first
 import hashlib
 import logging
 import platform

@@ -223,7 +223,8 @@ class EventBus:
         Publish an event to all matching subscribers.
         Also persists to SQLite if configured.
         """
-        self._event_count += 1
+        with self._lock:
+            self._event_count += 1
         self._buffer.append(event)
 
         # Persist to database
@@ -409,6 +410,49 @@ class EventBus:
             cursor = self._db_conn.execute(query, params)
             columns = [d[0] for d in cursor.description]
             return [dict(zip(columns, row)) for row in cursor.fetchall()]
+
+    def query_by_id(self, event_id: str) -> dict | None:
+        """Fetch a single event by its event_id. Returns dict or None."""
+        if not self._db_conn:
+            return None
+        with self._db_lock:
+            cursor = self._db_conn.execute(
+                "SELECT * FROM events WHERE event_id = ? LIMIT 1",
+                (event_id,)
+            )
+            columns = [d[0] for d in cursor.description]
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        return dict(zip(columns, row))
+
+    def count_events(self, *, category: str = None, severity: str = None,
+                     since: float = None, ack_state: str = None) -> int:
+        """Return count of matching events without loading rows."""
+        if not self._db_conn:
+            return 0
+
+        query = "SELECT COUNT(*) FROM events WHERE 1=1"
+        params = []
+
+        if category:
+            query += " AND category LIKE ?"
+            params.append(category.replace("*", "%"))
+        if severity:
+            query += " AND severity = ?"
+            params.append(severity)
+        if since:
+            query += " AND timestamp >= ?"
+            params.append(since)
+        if ack_state == "open":
+            query += " AND ack_state IS NULL"
+        elif ack_state in ("ack", "dismissed"):
+            query += " AND ack_state = ?"
+            params.append(ack_state)
+
+        with self._db_lock:
+            row = self._db_conn.execute(query, params).fetchone()
+        return row[0] if row else 0
 
     def query_case_events(self, case_id: str, *,
                           limit: int = 1000) -> list[dict]:

@@ -16,6 +16,7 @@ import shutil
 import signal
 import logging
 import hashlib
+import platform
 from pathlib import Path
 from typing import Optional
 
@@ -124,6 +125,34 @@ def _is_quarantine_allowed(
                 return f"config:{substring}"
 
     return None
+
+
+def _hash_file_chunked(filepath: str) -> str:
+    """SHA-256 hash a file in 64 KB chunks (avoids reading entire file into memory)."""
+    h = hashlib.sha256()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _lock_quarantined_file(filepath: str):
+    """Lock a quarantined file to prevent accidental execution."""
+    if platform.system().lower() == "windows":
+        try:
+            import subprocess
+            # Remove all permissions except SYSTEM (prevents user from running it)
+            subprocess.run(
+                ["icacls", str(filepath), "/inheritance:r",
+                 "/grant:r", "SYSTEM:(R)", "/grant:r", "Administrators:(R)"],
+                capture_output=True, timeout=10,
+            )
+        except Exception:
+            pass
+    try:
+        os.chmod(str(filepath), 0o000)
+    except OSError:
+        pass
 
 
 class ResponseEngine:
@@ -583,10 +612,8 @@ class ResponseEngine:
             return None
 
         try:
-            with open(filepath, "rb") as f:
-                content = f.read()
-            sha256 = hashlib.sha256(content).hexdigest()
-            md5 = hashlib.md5(content).hexdigest()
+            file_size = os.path.getsize(filepath)
+            sha256 = _hash_file_chunked(filepath)
 
             # Sibling quarantines get their own case_id, linked to parent.
             if parent_case_id is None:
@@ -615,8 +642,7 @@ class ResponseEngine:
                 "detection_event_id": case.get("detection_event_id"),
                 "original_path": str(filepath),
                 "sha256": sha256,
-                "md5": md5,
-                "size": len(content),
+                "size": file_size,
                 "quarantined_at": time.time(),
                 "reason": reason,
                 "rule_id": rule_id,
@@ -635,7 +661,7 @@ class ResponseEngine:
             meta_path.write_text(json.dumps(metadata, indent=2, default=str))
 
             shutil.move(filepath, str(quarantine_path))
-            os.chmod(str(quarantine_path), 0o000)
+            _lock_quarantined_file(str(quarantine_path))
 
             label = f"case={case_id}"
             if parent_case_id:
@@ -654,8 +680,7 @@ class ResponseEngine:
                     "quarantine_path": str(quarantine_path),
                     "meta_path": str(meta_path),
                     "sha256": sha256,
-                    "md5": md5,
-                    "size": len(content),
+                    "size": file_size,
                     "case": case if parent_case_id is None else {
                         "case_id": case_id,
                         "parent_case_id": parent_case_id,
@@ -667,7 +692,7 @@ class ResponseEngine:
                 "case_id": case_id,
                 "parent_case_id": parent_case_id,
                 "sha256": sha256,
-                "size": len(content),
+                "size": file_size,
                 "quarantine_path": str(quarantine_path),
                 "meta_path": str(meta_path),
                 "original_path": str(filepath),

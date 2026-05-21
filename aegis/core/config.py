@@ -222,4 +222,4 @@ class AegisConfig:
         return self._platform == "linux"
 
     def to_dict(self) -> dict:
-        return dict(self._data)
+        return copy.deepcopy(self._data)

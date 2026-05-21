@@ -22,6 +22,12 @@ Skipped (rule logged + ignored):
   - timeframe / temporal correlation across events
   - field types we don't extract (ParentCommandLine, IntegrityLevel, etc.)
 
+Limitation — negative matching:
+  Sigma rules with ``selection and not filter`` conditions have their filter
+  clauses silently dropped. This means false-positive exclusions defined in
+  the original rule are lost. A debug-level log line is emitted per rule
+  where this happens. Full negative-match support is tracked as future work.
+
 Result: load a directory of .yml Sigma rules, return BehavioralRules ready to
 plug into BehavioralEngine.RULES.
 """
@@ -127,6 +133,9 @@ def _parse_one(path: Path, doc: dict, used_ids: set[str]) -> BehavioralRule | No
     else:
         # default: take everything called "selection*"; ignore filters since
         # AEGIS has no negative-match support yet
+        if "not filter" in condition or "not" in condition:
+            logger.debug(f"Sigma rule {path.name}: filter/negation in condition dropped "
+                         f"(negative matching not yet supported)")
         wanted = [k for k in selection_keys if k.startswith("selection")]
         if not wanted:
             wanted = selection_keys[:1]

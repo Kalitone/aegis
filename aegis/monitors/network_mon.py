@@ -22,6 +22,14 @@ from aegis.core import EventBus, Event, EventCategory, Severity
 
 logger = logging.getLogger("aegis.monitors.network")
 
+# Severity ordering for robust comparison (avoids ValueError on unknown values)
+_SEV_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+
+
+def _max_severity(*sevs):
+    """Return the highest severity, defaulting unknown values to info-level."""
+    return max(sevs, key=lambda s: _SEV_ORDER.get(s.value, 0))
+
 # Well-known suspicious ports (C2, backdoors, tunneling)
 SUSPICIOUS_PORTS = {
     4444, 5555, 1337, 31337,    # Metasploit, common RATs
@@ -111,6 +119,7 @@ class NetworkMonitor:
         # Configurable thresholds
         self._suspicious_ports = SUSPICIOUS_PORTS | set(config.get("suspicious_ports", []))
         self._trusted_ports = TRUSTED_PORTS | set(config.get("trusted_ports", []))
+        self._burst_threshold = int(config.get("connection_burst_threshold", 20))
 
     def start(self):
         self._running = True
@@ -172,7 +181,7 @@ class NetworkMonitor:
                 # Detect connection bursts (possible scanning or beaconing)
                 for pid, count in pid_conn_count.items():
                     prev_count = self._connection_counts.get(pid, 0)
-                    if count - prev_count > 20:  # 20+ new connections in one interval
+                    if count - prev_count > self._burst_threshold:
                         self._handle_connection_burst(pid, count, prev_count)
 
                 self._known_listeners = current_listeners
@@ -218,7 +227,7 @@ class NetworkMonitor:
 
         # Connections to non-standard ports from unexpected processes
         if conn.remote_port not in self._trusted_ports:
-            severity = max(severity, Severity.LOW, key=lambda s: ["info","low","medium","high","critical"].index(s.value))
+            severity = _max_severity(severity, Severity.LOW)
 
         self.bus.publish(Event(
             category=EventCategory.NET_CONNECT,

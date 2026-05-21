@@ -275,10 +275,11 @@ class ThreatIntel:
         if new_domains or new_ips or new_hashes:
             global _BAD_DOMAINS, _BAD_IPS, _BAD_HASHES
             with _LOCK:
-                # cap defensively
-                _BAD_DOMAINS = set(list(new_domains)[:MAX_INDICATORS])
-                _BAD_IPS = set(list(new_ips)[:MAX_INDICATORS])
-                _BAD_HASHES = set(list(new_hashes)[:MAX_INDICATORS])
+                # cap defensively — sort before slicing so the surviving
+                # indicators are deterministic across runs
+                _BAD_DOMAINS = set(sorted(new_domains)[:MAX_INDICATORS])
+                _BAD_IPS = set(sorted(new_ips)[:MAX_INDICATORS])
+                _BAD_HASHES = set(sorted(new_hashes)[:MAX_INDICATORS])
             self._save_cache()
             logger.info(f"ThreatIntel refresh complete: {stats()}")
         else:

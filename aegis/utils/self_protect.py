@@ -216,7 +216,7 @@ def parent_is_service_host() -> bool:
         name = (parent.name() or "").lower()
         return name in ("services.exe", "nssm.exe", "python.exe", "pythonw.exe",
                         "cmd.exe", "powershell.exe", "pwsh.exe", "code.exe",
-                        "explorer.exe", "windowsterminal.exe")
+                        "windowsterminal.exe")
     except Exception:
         return True  # fail open — never wedge startup on a probe failure
 
@@ -250,7 +250,8 @@ def spawn_watchdog(argv: list[str]) -> int | None:
         return None
 
 
-def _watch(target_pid: int, relaunch_argv: list[str]) -> int:
+def _watch(target_pid: int, relaunch_argv: list[str],
+           data_dir: str = "data") -> int:
     """Block until target_pid exits, then relaunch the same command line.
     The watchdog itself exits after one relaunch (the new AEGIS will spawn
     its own fresh watchdog)."""
@@ -271,7 +272,7 @@ def _watch(target_pid: int, relaunch_argv: list[str]) -> int:
             pass
 
     # Don't respawn if AEGIS was asked to stop (file flag set during shutdown).
-    sentinel = Path("data/.aegis_clean_shutdown")
+    sentinel = Path(data_dir) / ".aegis_clean_shutdown"
     if sentinel.exists():
         try:
             sentinel.unlink()
@@ -293,12 +294,13 @@ def _watch(target_pid: int, relaunch_argv: list[str]) -> int:
     return 0
 
 
-def mark_clean_shutdown() -> None:
+def mark_clean_shutdown(data_dir: str = "data") -> None:
     """Called by the main process before a user-initiated stop so the
     watchdog doesn't immediately relaunch us."""
     try:
-        Path("data").mkdir(parents=True, exist_ok=True)
-        Path("data/.aegis_clean_shutdown").write_text(str(time.time()))
+        d = Path(data_dir)
+        d.mkdir(parents=True, exist_ok=True)
+        (d / ".aegis_clean_shutdown").write_text(str(time.time()))
     except OSError:
         pass
 

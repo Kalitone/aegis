@@ -65,7 +65,7 @@ rule suspicious_script_downloader {
         $e5 = "subprocess" ascii
         $e6 = "os.system" ascii
     condition:
-        any of ($d*) and any of ($e*)
+        any of ($d*) and 2 of ($e*)
 }
 
 rule cryptominer_strings {
@@ -104,7 +104,7 @@ rule reverse_shell_script {
         $py2 = ".connect((" ascii
         $py3 = "subprocess.call" ascii
     condition:
-        any of ($r*) or (2 of ($py*))
+        2 of ($r*) or (2 of ($py*))
 }
 
 rule webshell_generic {
@@ -122,7 +122,7 @@ rule webshell_generic {
         $asp2 = "Execute(Request" ascii nocase
         $jsp1 = "Runtime.getRuntime().exec" ascii
     condition:
-        any of them
+        2 of them
 }
 
 rule suspicious_packed_binary {
@@ -136,7 +136,7 @@ rule suspicious_packed_binary {
         $nsp = ".nsp0" ascii
         $aspack = "aPLib" ascii
     condition:
-        any of them
+        (uint16(0) == 0x5A4D or uint32(0) == 0x464C457F) and any of them
 }
 
 rule credential_access_file {
@@ -175,7 +175,7 @@ rule persistence_mechanism {
         $w1 = "HKLM\\\\Software\\\\Microsoft\\\\Windows\\\\CurrentVersion\\\\Run" ascii nocase
         $w2 = "schtasks /create" ascii nocase
     condition:
-        2 of them
+        filesize < 5MB and 3 of them
 }
 """
 
@@ -283,6 +283,9 @@ class YaraScanner:
             source="yara",
             data={"status": "started", "rules_loaded": True},
         ))
+
+    def stop(self):
+        self._running = False
 
     def _load_rules(self):
         """Load YARA rules from files and built-in rules."""
@@ -519,6 +522,14 @@ class YaraScanner:
         for root, dirs, files in os.walk(path):
             for fname in files:
                 fpath = os.path.join(root, fname)
+                if self._is_excluded(fpath):
+                    continue
+                try:
+                    size = os.path.getsize(fpath)
+                    if size > self._max_file_size or size == 0:
+                        continue
+                except OSError:
+                    continue
                 try:
                     matches = self._rules.match(fpath, timeout=self._scan_timeout)
                     for match in matches:

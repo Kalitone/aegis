@@ -183,9 +183,12 @@ class WebhookAlerter(_AsyncTransport):
 
     def _redact_url(self) -> str:
         # Never log the full URL — it may contain a secret token.
-        if len(self.url) < 40:
-            return self.url[:20] + "…"
-        return self.url[:30] + "…" + self.url[-10:]
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(self.url)
+            return f"{parsed.scheme}://{parsed.hostname}/…"
+        except Exception:
+            return self.url[:15] + "…"
 
     def _on_alert(self, event: Event):
         if not self._passes_severity(event):
@@ -454,6 +457,8 @@ class EmailAlerter(_AsyncTransport):
             server = smtplib.SMTP(self.host, self.port, timeout=10)
             server.ehlo()
             if self.port == 587:
+                # TLS: create_default_context() verifies server certificate chain.
+                # Hostname verification happens during the TLS handshake.
                 server.starttls(context=ssl.create_default_context())
                 server.ehlo()
         try:

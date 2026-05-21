@@ -295,6 +295,74 @@ RULES: list[BehavioralRule] = [
             r"unshare\s+",
         ],
     ),
+
+    # ── Windows LOLBin Abuse ──────────────────────────────
+    BehavioralRule(
+        rule_id="AEG-019",
+        name="Certutil Download",
+        description="Certutil used to download remote payload",
+        severity=Severity.HIGH,
+        mitre_attack="T1105",
+        cmdline_patterns=[
+            r"certutil\.exe.*(-urlcache|-split|-f).*http",
+        ],
+    ),
+
+    BehavioralRule(
+        rule_id="AEG-020",
+        name="MSHTA Execution",
+        description="MSHTA executing remote or inline script",
+        severity=Severity.CRITICAL,
+        mitre_attack="T1218.005",
+        cmdline_patterns=[
+            r"mshta\.exe.*(http|javascript|vbscript)",
+        ],
+    ),
+
+    BehavioralRule(
+        rule_id="AEG-021",
+        name="Regsvr32 Proxy Execution",
+        description="Regsvr32 used to proxy execute remote scriptlet",
+        severity=Severity.CRITICAL,
+        mitre_attack="T1218.010",
+        cmdline_patterns=[
+            r"regsvr32\.exe.*/s.*/i.*http",
+        ],
+    ),
+
+    BehavioralRule(
+        rule_id="AEG-022",
+        name="Rundll32 Abuse",
+        description="Rundll32 executing JavaScript or suspicious shell function",
+        severity=Severity.HIGH,
+        mitre_attack="T1218.011",
+        cmdline_patterns=[
+            r"rundll32\.exe.*javascript",
+            r"rundll32\.exe.*shell32",
+        ],
+    ),
+
+    BehavioralRule(
+        rule_id="AEG-023",
+        name="BITSAdmin Download",
+        description="BITSAdmin used to download remote payload",
+        severity=Severity.HIGH,
+        mitre_attack="T1197",
+        cmdline_patterns=[
+            r"bitsadmin.*/transfer.*http",
+        ],
+    ),
+
+    BehavioralRule(
+        rule_id="AEG-024",
+        name="PowerShell Encoded Command",
+        description="PowerShell executing base64-encoded command",
+        severity=Severity.HIGH,
+        mitre_attack="T1059.001",
+        cmdline_patterns=[
+            r"powershell.*-[eE]n[cC].*[A-Za-z0-9+/=]{20,}",
+        ],
+    ),
 ]
 
 

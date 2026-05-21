@@ -21,6 +21,9 @@ from aegis.core import EventBus, Event, EventCategory, Severity
 
 logger = logging.getLogger("aegis.monitors.resource")
 
+# Maximum history entries kept per PID to prevent unbounded growth.
+_MAX_HISTORY = 100
+
 
 class ResourceMonitor:
     """Monitors system resource usage per-process."""
@@ -81,13 +84,17 @@ class ResourceMonitor:
                         self._cpu_history[pid].append((now, cpu))
                         self._mem_history[pid].append((now, mem_mb))
 
-                        # Trim old entries
+                        # Trim old entries by time, then cap length
                         self._cpu_history[pid] = [
                             (t, v) for t, v in self._cpu_history[pid] if t > cutoff
                         ]
                         self._mem_history[pid] = [
                             (t, v) for t, v in self._mem_history[pid] if t > cutoff
                         ]
+                        if len(self._cpu_history[pid]) > _MAX_HISTORY:
+                            self._cpu_history[pid] = self._cpu_history[pid][-_MAX_HISTORY:]
+                        if len(self._mem_history[pid]) > _MAX_HISTORY:
+                            self._mem_history[pid] = self._mem_history[pid][-_MAX_HISTORY:]
 
                         # Check sustained CPU
                         self._check_cpu(pid, info)

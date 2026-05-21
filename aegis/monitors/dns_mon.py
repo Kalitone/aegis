@@ -141,9 +141,12 @@ class DnsMonitor:
     def _collect(self) -> list[str]:
         if self._platform == "windows":
             return _windows_displaydns()
-        # On Linux we can read systemd-resolve --statistics or the journal,
-        # but for now — fall back to /etc/hosts + getent ahosts cache, which
-        # is intentionally minimal. Real coverage needs scapy or eBPF.
+        # No DNS cache parsing available on non-Windows platforms.
+        # Log once so operators know they're blind.
+        if not getattr(self, "_linux_warned", False):
+            logger.info("DnsMon: DNS cache parsing not available on this platform. "
+                        "Consider enabling SNI capture (scapy) for DNS visibility.")
+            self._linux_warned = True
         return []
 
     def _publish(self, domain: str):

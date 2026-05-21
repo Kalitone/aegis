@@ -472,9 +472,8 @@ def _layout(active: str, page_html: str) -> str:
 <meta charset="utf-8">
 <title>AEGIS — {active.title()}</title>
 <link rel="stylesheet" href="/static/aegis.css">
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://unpkg.com/htmx.org@1.9.10"></script>
-<script defer src="https://unpkg.com/alpinejs@3.13.5/dist/cdn.min.js"></script>
+<script src="/static/htmx.min.js"></script>
+<script defer src="/static/alpine.min.js"></script>
 </head>
 <body x-data="aegis()" x-init="init()" @keydown.window="onkey($event)">
 <div class="shell">
@@ -580,10 +579,30 @@ def create_app(event_bus: EventBus, config: dict, aegis_ref=None):
     hostname = socket.gethostname()
     started_at = time.time()
 
-    # ── Static CSS ────────────────────────────────────────────────
+    # ── Static files ─────────────────────────────────────────────
     @app.get("/static/aegis.css")
     def css():
         return Response(content=AEGIS_CSS, media_type="text/css")
+
+    @app.get("/static/{filename}")
+    def static_file(filename: str):
+        if filename == "aegis.css":
+            return css()
+        static_dir = Path(__file__).parent / "static"
+        path = static_dir / filename
+        if not path.exists() or ".." in filename:
+            raise HTTPException(404, "Static file not found")
+        media = "text/javascript" if filename.endswith(".js") else "text/css"
+        return Response(content=path.read_text(), media_type=media)
+
+    # Warn if JS dependencies are missing
+    _static_dir = Path(__file__).parent / "static"
+    for _dep in ("htmx.min.js", "alpine.min.js"):
+        if not (_static_dir / _dep).exists():
+            logger.warning(
+                f"Static file missing: {_static_dir / _dep} — "
+                f"download it during install for air-gapped operation"
+            )
 
     # ── Page: Live event stream ───────────────────────────────────
     @app.get("/", response_class=HTMLResponse)
@@ -887,12 +906,12 @@ window.aegisInst = window.aegisInst || {{ selectRow: el => {{
                                       ack_state=ack_filter)
         # Counts for the filter tabs
         counts = {
-            "open": len(event_bus.query_events(category="detection.%",
-                                               limit=10000, ack_state="open")),
-            "ack":  len(event_bus.query_events(category="detection.%",
-                                               limit=10000, ack_state="ack")),
-            "dismissed": len(event_bus.query_events(category="detection.%",
-                                                    limit=10000, ack_state="dismissed")),
+            "open": event_bus.count_events(category="detection.%",
+                                           ack_state="open"),
+            "ack":  event_bus.count_events(category="detection.%",
+                                           ack_state="ack"),
+            "dismissed": event_bus.count_events(category="detection.%",
+                                                ack_state="dismissed"),
         }
         body_rows = []
         for r in rows:
@@ -1237,14 +1256,14 @@ function filterFindings(q){{
         # event rate (last 60s)
         since = time.time() - 60
         try:
-            rate = len(event_bus.query_events(since=since, limit=10000))
+            rate = event_bus.count_events(since=since)
         except Exception:
             rate = 0
         # unacked criticals (last hour)
         try:
-            crit = len(event_bus.query_events(severity="critical",
-                                              since=time.time()-3600, limit=10000,
-                                              ack_state="open"))
+            crit = event_bus.count_events(severity="critical",
+                                          since=time.time()-3600,
+                                          ack_state="open")
         except Exception:
             crit = 0
         # uptime
@@ -1396,8 +1415,7 @@ window.aegisInst = window.aegisInst || {{ selectRow: el => {{
 
     @app.get("/api/event/{event_id}", response_class=HTMLResponse)
     def api_event(event_id: str):
-        rows = event_bus.query_events(limit=10000)
-        match = next((r for r in rows if r.get("event_id") == event_id), None)
+        match = event_bus.query_by_id(event_id)
         if not match:
             return HTMLResponse('<div class="empty">Event not found.</div>')
         sev = (match.get("severity") or "info").lower()

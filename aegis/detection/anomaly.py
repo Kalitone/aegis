@@ -352,11 +352,12 @@ class AnomalyDetector:
         if now - last < self._dedup_window:
             return
         self._recent_hashes[sig] = now
-        # Trim old hashes occasionally
-        if len(self._recent_hashes) > 1000:
+        # Trim old hashes periodically to bound memory
+        if len(self._recent_hashes) > 500:
+            cutoff = now - self._dedup_window * 2
             self._recent_hashes = {
                 k: v for k, v in self._recent_hashes.items()
-                if now - v < 60
+                if v > cutoff
             }
 
         if self._storm_breaker is not None and not self._storm_breaker.try_admit(now):

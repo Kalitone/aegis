@@ -103,10 +103,44 @@ class SupplyChainScanner:
     def start(self):
         self._load_malicious_db()
         self._running = True
+        # Subscribe to file creation events to monitor package installations
+        self.bus.subscribe("file.create", self._on_file_event)
         logger.info(f"Supply chain scanner started "
                     f"({len(self._malicious)} known-bad names, "
                     f"{len(self.popular_pypi)} PyPI / "
                     f"{len(self.popular_npm)} npm reference names)")
+
+    def _on_file_event(self, event):
+        """Check newly created files in pip/npm cache directories."""
+        path = event.data.get("path", "")
+        if not path:
+            return
+        path_lower = path.lower().replace("\\", "/")
+        # Check if this is a pip or npm package installation
+        is_pip = "site-packages" in path_lower or "pip" in path_lower
+        is_npm = "node_modules" in path_lower
+        if not (is_pip or is_npm):
+            return
+        ecosystem = "npm" if is_npm else "pypi"
+        # Extract package name from path
+        parts = path_lower.split("/")
+        for i, part in enumerate(parts):
+            if part in ("site-packages", "node_modules") and i + 1 < len(parts):
+                pkg_name = parts[i + 1].split("-")[0]
+                if pkg_name:
+                    findings = self.check_package_name(pkg_name, ecosystem)
+                    for f in findings:
+                        sev = f.get("severity", Severity.MEDIUM)
+                        self.bus.publish(Event(
+                            category=EventCategory.DETECTION_SUPPLY_CHAIN,
+                            severity=sev if isinstance(sev, Severity) else Severity.MEDIUM,
+                            source="supply_chain",
+                            mitre_attack="T1195.002",
+                            data={"rule_name": f.get("rule"), "package": pkg_name,
+                                  "ecosystem": ecosystem, "detail": f.get("detail", ""),
+                                  "path": path},
+                        ))
+                break
 
     def stop(self):
         self._running = False
